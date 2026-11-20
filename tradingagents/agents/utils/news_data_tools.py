@@ -31,6 +31,9 @@ def get_news(
     """
     Retrieve news data for a given stock code.
     Uses the configured news_data vendor.
+    The A-share vendor keeps an item only when its timestamp parses and is at or
+    before the end date in Asia/Shanghai. Unknown times are dropped and counted.
+    The feed is a latest page, not a complete historical archive.
     Args:
         ticker (str): 6-digit A-stock code, e.g. 600379, 300750. Must be the numeric code, not the company name.
         start_date (str): Start date in yyyy-mm-dd format
@@ -52,6 +55,9 @@ def get_global_news(
     """
     Retrieve global news data.
     Uses the configured news_data vendor.
+    The A-share vendor applies the same Asia/Shanghai as-of filter to every
+    branch, including the 7x24 wire. Unknown timestamps are dropped.
+    look_back_days is a real time filter, not only a heading.
     Args:
         curr_date (str): Current date in yyyy-mm-dd format
         look_back_days (int): Number of days to look back (default 7)
