@@ -6,7 +6,7 @@
 - **仓库**: https://github.com/simonlin1212/TradingAgents-astock
 - **协议**: Apache 2.0
 - **Python**: >=3.10
-- **当前版本**: 0.5.23（2026-11-20）
+- **当前版本**: 0.5.24（2026-11-21）
   ⚠️ 改版本号时**三处要一起改**：`pyproject.toml` / `CHANGELOG.md` / 这一行。漏了这行会让后续 agent 和发版流程读到旧版本（`tests/test_version_consistency.py` 会拦）。
 
 ## 架构
@@ -15,9 +15,9 @@
 | 来源 | 协议 | 数据 |
 |------|------|------|
 | 腾讯 fqkline | HTTP (web.ifzq.gtimg.cn) | 日 K OHLCV（默认，不复权/前复权；量是手） |
-| mootdx | TCP 7709 | 可选日 K、财务快照、F10 文本 |
+| mootdx | TCP 7709 | 可选日 K、F10 文本；财务快照只是数秒级后备 |
 | 腾讯财经 | HTTP (qt.gtimg.cn) | PE/PB/市值/换手率 |
-| 东方财富 datacenter | HTTP (datacenter-web) | 龙虎榜、限售解禁、板块行情 |
+| 东方财富 datacenter | HTTP (datacenter-web / datacenter `RPT_F10_FINANCE_MAINFINADATA`) | 龙虎榜、限售解禁、板块行情、财务快照（NOTICE_DATE 截断） |
 | 东方财富 push2/push2his | HTTP (push2.eastmoney) | 实时行情、个股信息、板块列表、资金流(分钟+日级) |
 | 东方财富 np-weblist | HTTP | 滚动新闻 |
 | 新浪财经 | HTTP (money.finance.sina) | K线历史、财报三表 |
@@ -76,7 +76,23 @@ curr_date 过滤历史行、复盘时整段不取实时分钟数据）；数据�
 字段顺序是 `date, open, close, high, low, volume`，不是 OHLC。`ASTOCK_OHLCV_SOURCE=mootdx|sina`
 或配置项 `astock_ohlcv_source` 才改回旧路径；`ASTOCK_OHLCV_ADJUST=qfq` 只对腾讯生效。分析日之后的
 bar 丢掉，缺失 OHLC 不填 0。失败必须带 HTTP 状态和 body 长度，不能再写成「请检查网络连接」。
-mootdx 仍负责财务快照和 F10，不再是日 K 的默认第一跳。
+mootdx 不再是日 K 或财务快照的默认第一跳。F10 文本仍走 mootdx。
+
+### 基本面不要被 mootdx 选服堵住（v0.5.24）
+`get_fundamentals` 先取腾讯当前估值（标明不是历史收盘），再取东财
+`RPT_F10_FINANCE_MAINFINADATA`，用 `NOTICE_DATE`（没有才用 `UPDATE_DATE`）相对分析日截断。
+公告日晚于分析日的行丢掉，缺失数字不填 0。mootdx `finance` 只在东财没有窗口内报告时作为
+约 6 秒后备，失败写成 `[数据缺失: mootdx财务快照]`。
+
+`_get_mootdx_client()` 有约 12 秒墙钟预算，到点失败并写负缓存。`Quotes.factory` 必须传入
+短 `timeout`（约 4 秒）；传 0 会被 mootdx 当成库默认 15 秒。时间还够时不要改回「连续 N 台
+失败就停」——停的理由只能是预算用完或候选试完。
+
+并行 ToolNode 的每个工具有约 25 秒硬超时（`make_tool_call_recorder`），超时返回错误字符串，
+不能让一个工具把整批结果卡住。工具开始/结束写 `logs/RUN_STATUS.md` 和
+`logs/runtime_status.log`。状态还是 `running` 时，atexit / SIGINT / SIGTERM 要改成 `failed`
+并写原因。新浪三张表仍没有披露钟点；读超时只重试一次，401/403/429/451 和验证码页不重试。
+同花顺一致预期和东财行业对比失败就标明缺失，不要再换一个没核实过的源。
 
 `get_news` / `get_global_news`（含财联社与东财 7x24）只保留能解析、且不晚于分析日
 23:59:59.999999（Asia/Shanghai，固定 UTC+8）的条目。解析失败就丢弃并计数，禁止默纳。

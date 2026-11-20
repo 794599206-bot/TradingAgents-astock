@@ -5,7 +5,7 @@ or mootdx TCP.
 
 Data sources:
 - Tencent fqkline (HTTP): default daily OHLCV (none/qfq). Volume is 手.
-- mootdx (TCP 7709): optional OHLCV, financial snapshots, F10 text
+- mootdx (TCP 7709): optional OHLCV, optional finance fallback, F10 text
 - Tencent Finance (HTTP GBK): PE/PB/market cap/turnover
 - 东方财富 push2 / datacenter-web (direct HTTP): stock info, dragon-tiger, lockup
 - 新浪财经 (direct HTTP): optional K-line, financial statements
@@ -33,6 +33,8 @@ import urllib.request
 
 import pandas as pd
 import requests as _requests
+
+from tradingagents.bounded_call import DeadlineExceeded, call_with_timeout
 
 from .news_asof import FilteredNews, asof_bounds, filter_news_items, render_news_report
 from .public_ohlcv import (
@@ -275,10 +277,18 @@ _TDX_CANARY_SYMBOL = "600519"
 _MOOTDX_RETRY_AFTER_S = 300.0
 _mootdx_unavailable_until = 0.0
 
-# ⚠️ 曾经加过「连续 N 台协议失败就停手」的提前退出，已移除：三台远端拒绝**证明不了**
-# 本地网络封了协议，而列表里靠后的服务器完全可能是好的。提前收手会让那台可用服务器
-# 永远试不到，还顺手记下 5 分钟负缓存。省下的十几秒不值得换这个风险——真正的耗时
-# 大头是 bestip 全表测速，那个已经单独规避了。
+# 选服墙钟预算。2026-11-21 实测 14 台 TCP 可连但 bars 全空，串行探完要 157.730 秒，
+# 而 LangGraph ToolNode 会等这一个工具，旁边已经成功的新浪财报也出不了结果。
+# 预算到点就失败并写负缓存，不再把空服务器串行探完。
+# 这和「连续 N 台失败就停」不是一回事：时间还够时仍按原顺序继续试后面的服务器，
+# 因为前面几台拒绝证明不了后面那台不可用。bestip 全表测速仍然不用。
+_MOOTDX_CLIENT_BUDGET_S = 12.0
+# mootdx Quotes 不传 timeout 时用库默认 15 秒（`timeout or 15`，传 0 也会变回 15）。
+_MOOTDX_FACTORY_TIMEOUT_S = 4
+_MOOTDX_BARS_TIMEOUT_S = 4.0
+_MOOTDX_TCP_PROBE_S = 1.0
+# 只在东财财务快照没有窗口内报告时才走 mootdx，并且不能挡住已经取到的东财/腾讯结果。
+_MOOTDX_FINANCE_FALLBACK_S = 6.0
 
 
 def _candidate_tdx_servers() -> list[tuple[str, int]]:
@@ -332,13 +342,52 @@ def _probe_tdx(ip: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
-def _tdx_client_works(client) -> bool:
-    """真实拉一根 K 线来验证这个 client 确实能取数。"""
-    try:
+def _tdx_client_works(client, timeout: float | None = None) -> bool:
+    """真实拉一根 K 线来验证这个 client 确实能取数。
+
+    ``timeout`` 是这一次读取的墙钟上限。socket timeout 在「端口通、取数空返回」
+    的服务器上仍可能接近库默认的十几秒，所以这里再卡一层，避免单台吃掉整个预算。
+    """
+
+    def read() -> bool:
         df = client.bars(symbol=_TDX_CANARY_SYMBOL, category=4, offset=1)
-        return df is not None and not df.empty
+        return df is not None and not getattr(df, "empty", True)
+
+    try:
+        if timeout is None:
+            return bool(read())
+        if timeout <= 0:
+            return False
+        return bool(call_with_timeout(read, timeout))
     except Exception:
         return False
+
+
+def _skip_mootdx_bestip(*_args, **_kwargs) -> None:
+    """Replace ``mootdx.config.bestip`` while snapshotting.
+
+    A missing config makes ``setup()`` speed-test every host. Write an empty
+    JSON file instead so the following ``load_config()`` succeeds. An existing
+    file is left untouched. ``setup()`` reads ``mootdx.config.CONF``, which is
+    bound at import, so the file has to be that path.
+    """
+    from pathlib import Path
+
+    import mootdx.config as mootdx_config
+
+    path = Path(mootdx_config.CONF)
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            return
+    except OSError:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() or path.stat().st_size == 0:
+        path.write_text("{}\n", encoding="utf-8")
+    logger.warning(
+        "跳过 mootdx bestip 全表测速（配置文件缺失或为空）。"
+        "选服有墙钟预算，不用那套测速。"
+    )
 
 
 def reset_mootdx_client() -> None:
@@ -371,11 +420,20 @@ def _preserve_mootdx_bestip():
 
     ⚠️ **做成上下文管理器而不是手动调还原函数**：此前是在两处分别调 `_restore_bestip()`，
     再加一条提前返回就会漏掉一处，而漏掉的后果是静默留下一台死服务器。
+
+    `config.setup()` 在配置文件缺失或损坏时会调用 ``bestip()``，把整张主机表测速一遍
+    （实测十几秒到几分钟）。选服自己有墙钟预算，所以这里把那次调用换成写一个空配置，
+    让 ``setup()`` 能读完文件。已有配置文件时不会改它，也不会跑测速。
     """
     saved = None
     try:
         from mootdx import config as _cfg
-        _cfg.setup()
+        previous_bestip = _cfg.bestip
+        _cfg.bestip = _skip_mootdx_bestip
+        try:
+            _cfg.setup()
+        finally:
+            _cfg.bestip = previous_bestip
         saved = _cfg.get("BESTIP")
         if isinstance(saved, dict):
             saved = dict(saved)
@@ -394,14 +452,30 @@ def _preserve_mootdx_bestip():
                 logger.debug("恢复 mootdx BESTIP 失败：%s", e)
 
 
-def _get_mootdx_client():
+def _mootdx_budget_s(budget_s: float | None) -> float:
+    if budget_s is None:
+        return _MOOTDX_CLIENT_BUDGET_S
+    return max(0.0, float(budget_s))
+
+
+def _factory_timeout_s(remaining: float) -> int:
+    """Seconds passed into ``Quotes.factory``. Never 0: mootdx treats 0 as 15."""
+    capped = min(float(_MOOTDX_FACTORY_TIMEOUT_S), max(0.0, remaining))
+    return max(1, min(int(_MOOTDX_FACTORY_TIMEOUT_S), int(capped)))
+
+
+def _get_mootdx_client(budget_s: float | None = None):
     """Lazy-init 健壮版 mootdx Quotes client（TCP 连接，可复用）。
 
-    选服务器的顺序：内置服务器表（TCP 预筛 + 真实取数验证）→ bestip 测速 →
-    裸 factory（老用户 config 里已有 IP）。每一级都必须真正取到数据才会被采用，
+    选服务器的顺序：内置服务器表（TCP 预筛 + 真实取数验证）→ 裸 factory
+    （老用户 config 里已有 IP）。每一级都必须真正取到数据才会被采用，
     避免把 client 钉死在一台"端口开着但协议不通"的服务器上（#90）。
-    全部失败时抛 RuntimeError，并在 `_MOOTDX_RETRY_AFTER_S` 内直接快速失败，
-    不再逐台重探。
+    ⚠️ 不用 ``bestip=True``：它会把整张主机表测速一遍，实测要几分钟。
+
+    整段选服有墙钟预算（默认 ``_MOOTDX_CLIENT_BUDGET_S``，约 8–15 秒）。
+    到点立即失败并写入 ``_MOOTDX_RETRY_AFTER_S`` 负缓存，不再逐台重探。
+    ``Quotes.factory`` 显式传入短 ``timeout``，不用库默认的 15 秒。
+    时间还够时不会因为「连续失败了几台」就停——停的唯一理由是预算用完或表试完。
     """
     global _mootdx_client, _mootdx_unavailable_until
     if _mootdx_client is not None:
@@ -411,70 +485,125 @@ def _get_mootdx_client():
     if now < _mootdx_unavailable_until:
         raise RuntimeError(
             "mootdx 通达信服务器暂不可用（%.0f 秒内不再重试）。"
-            "已尝试全部内置服务器：端口能连上的也没能完成通达信协议取数。"
+            "上一轮选服已在墙钟预算内失败。"
             "请检查网络环境（代理/防火墙/公司网络常拦 TCP 7709），"
             "或改用 6 位股票代码直接查询。" % (_mootdx_unavailable_until - now)
         )
 
     from mootdx.quotes import Quotes
 
+    budget = _mootdx_budget_s(budget_s)
+    started = time.monotonic()
+    deadline = started + budget
     tcp_ok_but_dead = 0
+    tried = 0
+    reachable: list[tuple[str, int]] = []
+    stopped_for_budget = False
+
+    def remaining() -> float:
+        return deadline - time.monotonic()
+
+    def open_client(server, timeout_s: int):
+        kwargs = {
+            "market": "std",
+            "timeout": timeout_s,
+            "heartbeat": False,
+            "auto_retry": False,
+        }
+        if server is not None:
+            kwargs["server"] = server
+
+        def build(options=kwargs):
+            return Quotes.factory(**options)
+
+        return call_with_timeout(
+            build,
+            min(float(timeout_s) + 0.5, max(0.05, remaining())),
+        )
+
     # 探测会覆写 mootdx 的持久化配置——包在这里，只有真选出可用服务器时才 keep()，
     # 其余每条退出路径（含异常）都自动还原。
     with _preserve_mootdx_bestip() as keep_bestip:
-        # TCP 预筛并发跑：38 台里多数是"连都连不上"，串行每台要等满超时（实测整轮
-        # 73.7s，首次调用像卡死）。预筛纯粹是等 IO，并发不改变选取语义——下面仍按
-        # 原顺序、逐台做真实取数验证，精选表依旧优先。
-        reachable = _reachable_tdx_servers(_candidate_tdx_servers())
+        # TCP 预筛并发跑。预筛是等 IO，不改变选取顺序：下面仍按候选表顺序做真实取数。
+        probe_timeout = min(_MOOTDX_TCP_PROBE_S, max(0.2, remaining()))
+        reachable = _reachable_tdx_servers(_candidate_tdx_servers(), probe_timeout)
 
         for ip, port in reachable:
+            if remaining() < 0.8:
+                stopped_for_budget = True
+                break
+            tried += 1
+            timeout_s = _factory_timeout_s(remaining())
             # 「TCP 通但通达信协议不通」有两种表现：factory 建连时握手就被拒，
-            # 或者建出来了但取不到数。**两种都要算**——只统计后者的话，计数永远是 0
-            # （实测这批服务器全是在 factory 里抛 ConnectionReset），下面的快速失败
-            # 判断就失效了。
+            # 或者建出来了但取不到数。**两种都要算**。
             try:
-                candidate = Quotes.factory(market="std", server=(ip, port))
+                candidate = open_client((ip, port), timeout_s)
+            except DeadlineExceeded:
+                tcp_ok_but_dead += 1
+                stopped_for_budget = True
+                logger.warning(
+                    "mootdx %s:%s 建连超过剩余预算，停止选服", ip, port
+                )
+                break
             except Exception as e:
                 tcp_ok_but_dead += 1
                 logger.debug("mootdx %s:%s 握手失败（%s），换下一台", ip, port, type(e).__name__)
-            else:
-                if _tdx_client_works(candidate):
-                    logger.info("mootdx server selected: %s:%s", ip, port)
-                    keep_bestip()   # 这次的覆写正是我们想要的，别还原
-                    _mootdx_client = candidate
-                    return _mootdx_client
+                continue
+            bars_budget = min(_MOOTDX_BARS_TIMEOUT_S, remaining())
+            if bars_budget < 0.4:
                 tcp_ok_but_dead += 1
-                logger.debug("mootdx %s:%s 建连成功但取不到数，换下一台", ip, port)
+                stopped_for_budget = True
+                break
+            if _tdx_client_works(candidate, timeout=bars_budget):
+                logger.info("mootdx server selected: %s:%s", ip, port)
+                keep_bestip()   # 这次的覆写正是我们想要的，别还原
+                _mootdx_client = candidate
+                return _mootdx_client
+            tcp_ok_but_dead += 1
+            logger.debug("mootdx %s:%s 建连成功但取不到数，换下一台", ip, port)
 
-    # 走到这里说明逐台探测都没成——上面的 with 已经把 BESTIP 还原成用户原本的配置，
-    # 下面的裸 factory 读的正是它，这个兜底才有意义。
-    # ⚠️ 刻意**不用** `bestip=True`：它会把整张主机表做一遍测速，实测要几分钟。
-    # `_candidate_tdx_servers()` 已经把 mootdx 自带的完整主机表逐台验证过了，
-    # 覆盖面不比 bestip 差，而且每台都是"真取到数才算通过"。
-    try:
-        candidate = Quotes.factory(market="std")
-    except Exception as e:
-        logger.debug("mootdx 裸 factory 失败 — %s", e)
-    else:
-        if _tdx_client_works(candidate):
-            logger.info("mootdx client from 裸 factory（用户已有配置）")
-            _mootdx_client = candidate
-            return _mootdx_client
+    # 裸 factory 必须等 with 把 BESTIP 还原成用户原来的配置之后再读。
+    # 放在 with 里面会读到最后一台失败服务器。预算不够就跳过，避免再挂一个库默认超时。
+    if not stopped_for_budget and remaining() >= 1.0:
+        timeout_s = _factory_timeout_s(remaining())
+        try:
+            candidate = open_client(None, timeout_s)
+        except Exception as e:
+            logger.debug("mootdx 裸 factory 失败 — %s", e)
+        else:
+            bars_budget = min(_MOOTDX_BARS_TIMEOUT_S, remaining())
+            if bars_budget >= 0.4 and _tdx_client_works(candidate, timeout=bars_budget):
+                logger.info("mootdx client from 裸 factory（用户已有配置）")
+                _mootdx_client = candidate
+                return _mootdx_client
 
+    elapsed = time.monotonic() - started
     _mootdx_unavailable_until = time.time() + _MOOTDX_RETRY_AFTER_S
     if tcp_ok_but_dead:
-        # 说清楚是"协议被拒"而不是"连不上"——这两者的排查方向完全不同。
         cause = (
             "%d 台服务器端口能连上，但通达信协议握手/取数被拒。"
             "这通常是协议层被拦（代理、防火墙、公司网络对 TCP 7709 的策略），"
             "换服务器解决不了。" % tcp_ok_but_dead
         )
+    elif stopped_for_budget and not reachable:
+        cause = "TCP 预筛还没结束，选服墙钟预算已经用完。"
     else:
         cause = "内置服务器表里没有一台的 TCP 7709 能连上，请检查网络连通性。"
+    stop = "预算用完后停止" if stopped_for_budget else "候选已试完"
     raise RuntimeError(
         "mootdx 通达信服务器不可用：%s"
+        "本次选服墙钟预算 %.1f 秒，实际 %.1f 秒，%s，验证了 %d/%d 台端口可连的服务器"
+        "（不再把空服务器串行探完）。"
         "可改用 6 位股票代码直接查询。%.0f 秒内将直接快速失败、不再逐台重探。"
-        % (cause, _MOOTDX_RETRY_AFTER_S)
+        % (
+            cause,
+            budget,
+            elapsed,
+            stop,
+            tried,
+            len(reachable),
+            _MOOTDX_RETRY_AFTER_S,
+        )
     )
 
 
@@ -484,8 +613,11 @@ def _mootdx_call(method: str, **kwargs):
     选中的服务器随时可能挂掉；不弃用的话单例会一直指着它，之后每次取数都失败降级
     且永不重选（#90 的「反复降级」）。取 client 本身失败时不清缓存——那条路径已经
     在 `_get_mootdx_client` 里做了负缓存，清掉等于取消快速失败。
+
+    ``_budget_s`` 只约束选服，不会传给 mootdx 方法本身。
     """
-    client = _get_mootdx_client()
+    budget_s = kwargs.pop("_budget_s", None)
+    client = _get_mootdx_client(budget_s=budget_s)
     try:
         return getattr(client, method)(**kwargs)
     except Exception:
@@ -497,16 +629,17 @@ def _mootdx_call(method: str, **kwargs):
 # Tencent Finance API
 # ---------------------------------------------------------------------------
 
-def _tencent_quote(codes: list[str]) -> dict[str, dict]:
+def _tencent_quote(codes: list[str], timeout: float = 10) -> dict[str, dict]:
     """Batch real-time quotes from Tencent Finance (qt.gtimg.cn).
 
     Returns dict[code] -> {name, price, pe_ttm, pb, mcap_yi, ...}
+    The quote is the current snapshot. It is not a historical as-of close.
     """
     prefixed = [f"{_get_prefix(c)}{c}" for c in codes]
     url = "https://qt.gtimg.cn/q=" + ",".join(prefixed)
     req = urllib.request.Request(url)
     req.add_header("User-Agent", "Mozilla/5.0")
-    resp = urllib.request.urlopen(req, timeout=10)
+    resp = urllib.request.urlopen(req, timeout=timeout)
     raw = resp.read().decode("gbk")
 
     result = {}
@@ -543,7 +676,12 @@ def _tencent_quote(codes: list[str]) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 _DATACENTER_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+# 2026-11-21 实测可用的财务快照。datacenter-web 的 F10 ajax 当时是空壳，不要换回去。
+_MAINFINA_URL = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
+_MAINFINA_REPORT = "RPT_F10_FINANCE_MAINFINADATA"
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+_FUNDAMENTALS_BUDGET_S = 20.0
+_HTTP_TIMEOUT_S = 8.0
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +718,274 @@ def _em_get(url, params=None, headers=None, timeout=15, **kwargs):
         _em_last_call[0] = time.time()
 
 
+def _http_observation(resp, *, source: str) -> str:
+    """Status and body length for a failed public response. No secrets, no full body."""
+    status = getattr(resp, "status_code", None)
+    status_text = str(status) if isinstance(status, int) else "unknown"
+    body = getattr(resp, "content", None)
+    sample = ""
+    if isinstance(body, str):
+        body_len = len(body.encode("utf-8", errors="replace"))
+        sample = body[:800]
+    elif isinstance(body, (bytes, bytearray)):
+        body_len = len(body)
+        sample = bytes(body[:800]).decode("utf-8", errors="replace")
+    else:
+        body_len = None
+    blocked = isinstance(status, int) and response_is_blocked(status, sample)
+    length_text = "unknown" if body_len is None else str(body_len)
+    extra = " Blocked or risk page, not retried." if blocked else ""
+    return (
+        f"source={source} HTTP status={status_text} body_length={length_text}.{extra}"
+    )
+
+
+def _body_sample(resp) -> str:
+    body = getattr(resp, "content", None)
+    if isinstance(body, str):
+        return body[:800]
+    if isinstance(body, (bytes, bytearray)):
+        return bytes(body[:800]).decode("utf-8", errors="replace")
+    return ""
+
+
+def _read_json_body(resp):
+    """Parse JSON, keeping decimal strings when the raw body is available."""
+    raw = getattr(resp, "content", None)
+    if isinstance(raw, (bytes, bytearray)) and raw:
+        return _json.loads(bytes(raw).decode("utf-8", "replace"), parse_float=str)
+    if isinstance(raw, str) and raw.strip():
+        return _json.loads(raw, parse_float=str)
+    return resp.json()
+
+
+def _reject_blocked_response(resp, *, source: str) -> None:
+    status = getattr(resp, "status_code", None)
+    if not isinstance(status, int):
+        return
+    sample = _body_sample(resp)
+    if response_is_blocked(status, sample):
+        raise RuntimeError(
+            _http_observation(resp, source=source)
+            + " Refused (401/403/429/451 or captcha/risk). Not retried."
+            " No figures were filled with zeros."
+        )
+    if status != 200:
+        raise RuntimeError(
+            _http_observation(resp, source=source)
+            + " Not retried. No figures were filled with zeros."
+        )
+
+
+def _em_calendar_day(value) -> date | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"null", "none", "nan", "--"}:
+        return None
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _as_of_day(curr_date) -> date:
+    if curr_date:
+        try:
+            return datetime.strptime(str(curr_date)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    return _market_today()
+
+
+def _mainfina_in_window(row: dict, as_of: date) -> bool:
+    """Keep a mainfina row only when its disclosure is on or before ``as_of``.
+
+    ``NOTICE_DATE`` is the publication gate. ``UPDATE_DATE`` is used only when
+    the notice is missing. A report period alone is not a publication time.
+    A report period after the as-of date is dropped even if a notice is present.
+    """
+    if not isinstance(row, dict):
+        return False
+    report = _em_calendar_day(row.get("REPORT_DATE"))
+    if report is not None and report > as_of:
+        return False
+    notice = _em_calendar_day(row.get("NOTICE_DATE"))
+    if notice is not None:
+        return notice <= as_of
+    updated = _em_calendar_day(row.get("UPDATE_DATE"))
+    if updated is not None:
+        return updated <= as_of
+    return False
+
+
+def _metric_text(value) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none", "null", "--"}:
+        return None
+    return text
+
+
+_MAINFINA_FIELDS = (
+    ("EPSJB", "EPS (basic)"),
+    ("BPS", "Book value per share"),
+    ("TOTALOPERATEREVE", "Total operating revenue"),
+    ("PARENTNETPROFIT", "Net profit attributable to parent"),
+    ("ROEJQ", "ROE (weighted, %)"),
+    ("ZCFZL", "Asset-liability ratio (%)"),
+    ("TOTAL_SHARE", "Total shares"),
+)
+
+
+def _format_mainfina_row(row: dict, as_of: date, dropped: int) -> str:
+    report = _em_calendar_day(row.get("REPORT_DATE"))
+    notice = _em_calendar_day(row.get("NOTICE_DATE"))
+    updated = _em_calendar_day(row.get("UPDATE_DATE"))
+    lines = [
+        "## 财务快照（东财 datacenter，按公告日截断）",
+        f"Source: {_MAINFINA_REPORT}",
+        f"As-of: {as_of.isoformat()} (Asia/Shanghai calendar date)",
+        (
+            f"Report: {report.isoformat() if report else 'unknown'}"
+            f" {row.get('REPORT_TYPE') or ''}".rstrip()
+        ),
+        f"NOTICE_DATE: {notice.isoformat() if notice else 'missing'}",
+        f"UPDATE_DATE: {updated.isoformat() if updated else 'missing'}",
+        (
+            "Disclosure: NOTICE_DATE is the publication date used for the as-of "
+            "filter. This snapshot does not invent a clock time."
+        ),
+        f"Rows dropped because notice/report is after as-of: {dropped}",
+    ]
+    if updated is not None and updated > as_of and notice is not None and notice <= as_of:
+        lines.append(
+            "⚠️ UPDATE_DATE is after the as-of date. The notice date is inside "
+            "the window; figures may include a later revision."
+        )
+    name = _metric_text(row.get("SECURITY_NAME_ABBR"))
+    if name:
+        lines.append(f"Name: {name}")
+    for field, label in _MAINFINA_FIELDS:
+        shown = _metric_text(row.get(field))
+        if shown is not None:
+            lines.append(f"{label}: {shown}")
+    return "\n".join(lines)
+
+
+def _eastmoney_main_finance(code: str, curr_date: str | None, timeout: float) -> tuple[str, bool]:
+    """Latest in-window mainfina row. ``ok`` is False when nothing can be used."""
+    as_of = _as_of_day(curr_date)
+    params = {
+        "reportName": _MAINFINA_REPORT,
+        "columns": "ALL",
+        "filter": f'(SECURITY_CODE="{code}")',
+        "pageNumber": "1",
+        "pageSize": "8",
+        "sortTypes": "-1",
+        "sortColumns": "REPORT_DATE",
+        "source": "WEB",
+        "client": "WEB",
+    }
+    try:
+        resp = _em_get(_MAINFINA_URL, params=params, timeout=timeout)
+        _reject_blocked_response(resp, source="eastmoney-mainfina")
+        payload = _read_json_body(resp)
+    except Exception as exc:
+        detail = str(exc)
+        if "HTTP status=" not in detail and "timed out" not in detail.lower():
+            detail = f"{type(exc).__name__}: {exc}"
+        return (
+            f"[数据缺失: 东财财务快照] {detail} No figures were filled with zeros.",
+            False,
+        )
+    result = payload.get("result") if isinstance(payload, dict) else None
+    rows = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(rows, list) or not rows:
+        observation = _http_observation(resp, source="eastmoney-mainfina")
+        return (
+            "[数据缺失: 东财财务快照] response had no report rows. "
+            f"{observation} No figures were filled with zeros.",
+            False,
+        )
+    dropped = 0
+    kept: list[dict] = []
+    for row in rows:
+        if isinstance(row, dict) and _mainfina_in_window(row, as_of):
+            kept.append(row)
+        else:
+            dropped += 1
+    if not kept:
+        return (
+            "[数据缺失: 东财财务快照] no report is inside the as-of window "
+            f"{as_of.isoformat()} (NOTICE_DATE/UPDATE_DATE). "
+            f"Dropped {dropped} row(s). No figures were filled with zeros.",
+            False,
+        )
+    kept.sort(key=lambda row: _em_calendar_day(row.get("REPORT_DATE")) or date.min, reverse=True)
+    return _format_mainfina_row(kept[0], as_of, dropped), True
+
+
+def _format_mootdx_finance(fin) -> str | None:
+    if fin is None or (isinstance(fin, pd.DataFrame) and fin.empty):
+        return None
+    row = fin.iloc[0] if isinstance(fin, pd.DataFrame) else fin
+    field_map = {
+        "eps": "EPS (Quarterly)",
+        "bvps": "Book Value Per Share",
+        "roe": "ROE (%)",
+        "profit": "Net Profit",
+        "income": "Revenue",
+        "liutongguben": "Float Shares",
+        "zongguben": "Total Shares",
+    }
+    idx = row.index if hasattr(row, "index") else []
+    lines = ["## 财务快照（mootdx 限时后备）", "Source: mootdx finance"]
+    found = False
+    for field, label in field_map.items():
+        if field not in idx:
+            continue
+        shown = _metric_text(row[field])
+        if shown is not None:
+            lines.append(f"{label}: {shown}")
+            found = True
+    if not found:
+        return None
+    return "\n".join(lines)
+
+
+def _mootdx_finance_fallback(code: str, budget_s: float) -> str:
+    """Optional finance snapshot. Must return before ``budget_s`` elapses."""
+    budget = min(_MOOTDX_FINANCE_FALLBACK_S, max(0.0, float(budget_s)))
+    if budget < 0.5:
+        return (
+            "[数据缺失: mootdx财务快照] skipped; no time left in the fundamentals "
+            "budget. Eastmoney/Tencent results above are unchanged."
+        )
+    inner = max(0.4, budget - 0.4)
+
+    def read():
+        return _mootdx_call("finance", symbol=code, _budget_s=inner)
+
+    try:
+        fin = call_with_timeout(read, budget)
+    except Exception as exc:
+        logger.warning("mootdx finance failed for %s: %s", code, exc)
+        return (
+            f"[数据缺失: mootdx财务快照] {type(exc).__name__}: {exc} "
+            "Eastmoney/Tencent results above are unchanged. "
+            "No figures were filled with zeros."
+        )
+    text = _format_mootdx_finance(fin)
+    if text is None:
+        return (
+            "[数据缺失: mootdx财务快照] finance() returned no usable fields. "
+            "No figures were filled with zeros."
+        )
+    return text
+
+
 def _eastmoney_datacenter(
     report_name: str,
     columns: str = "ALL",
@@ -612,8 +1018,11 @@ def _eastmoney_datacenter(
 # ---------------------------------------------------------------------------
 
 
-def _ths_eps_forecast(code: str) -> pd.DataFrame:
+def _ths_eps_forecast(code: str, timeout: float = 6.0) -> pd.DataFrame:
     """Fetch consensus EPS forecast from 同花顺 (direct HTTP).
+
+    One request. 401/403/429/451, captcha/risk pages, HTTP errors, and empty
+    bodies are not retried. There is no second source.
 
     Returns DataFrame with columns roughly: 年度, 预测机构数, 最小值, 均值, 最大值.
     """
@@ -622,16 +1031,54 @@ def _ths_eps_forecast(code: str) -> pd.DataFrame:
         "User-Agent": _UA,
         "Referer": "https://basic.10jqka.com.cn/",
     }
-    r = _requests.get(url, headers=headers, timeout=15)
-    r.encoding = "gbk"
-    dfs = pd.read_html(io.StringIO(r.text))
-    # Find the table containing EPS data
+    try:
+        response = _requests.get(url, headers=headers, timeout=timeout)
+    except _requests.Timeout as exc:
+        raise RuntimeError(
+            f"[数据缺失: 一致预期EPS] source=tonghuashun timeout "
+            f"({type(exc).__name__}: {exc}). Not retried. "
+            "No figures were filled with zeros."
+        ) from exc
+    _reject_blocked_response(response, source="tonghuashun")
+    if not _body_sample(response).strip() and not (
+        isinstance(getattr(response, "content", None), (bytes, bytearray))
+        and len(response.content) > 0
+    ):
+        # MagicMock responses used by older tests have no real body; only an
+        # explicit empty bytes/str body is a failed page.
+        content = getattr(response, "content", None)
+        if isinstance(content, (bytes, bytearray, str)) and not content:
+            raise RuntimeError(
+                "[数据缺失: 一致预期EPS] "
+                + _http_observation(response, source="tonghuashun")
+                + " Empty body. Not retried. No figures were filled with zeros."
+            )
+    response.encoding = "gbk"
+    try:
+        dfs = pd.read_html(io.StringIO(response.text))
+    except ImportError as exc:
+        raise RuntimeError(
+            "[数据缺失: 一致预期EPS] "
+            + _http_observation(response, source="tonghuashun")
+            + f" HTML parser unavailable ({type(exc).__name__}: {exc}). Not retried."
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(
+            "[数据缺失: 一致预期EPS] "
+            + _http_observation(response, source="tonghuashun")
+            + f" Page had no EPS table ({type(exc).__name__}: {exc}). Not retried."
+        ) from exc
     for df in dfs:
         cols = [str(c) for c in df.columns]
         if any("每股收益" in c or "均值" in c for c in cols):
             return df
-    # Fallback: return first table if exists
-    return dfs[0] if dfs else pd.DataFrame()
+    if dfs:
+        return dfs[0]
+    raise RuntimeError(
+        "[数据缺失: 一致预期EPS] "
+        + _http_observation(response, source="tonghuashun")
+        + " Page had no table. Not retried."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1405,25 +1852,99 @@ def get_indicators(
 # ---- 3. get_fundamentals ----
 
 
+def _consensus_block(code: str, frame: pd.DataFrame, price: float | None) -> str:
+    """Format a Tonghuashun EPS table. Missing cells are omitted, not set to 0."""
+    lines = ["## 一致预期 EPS（同花顺，当前预测，不是历史时点）"]
+    eps_by_year: dict[str, float] = {}
+    for _, row in frame.iterrows():
+        year = str(row.iloc[0]) if len(row) > 0 else ""
+        count_text = _metric_text(row.iloc[1] if len(row) > 1 else None)
+        min_text = _metric_text(row.iloc[2] if len(row) > 2 else None) or "N/A"
+        mean_text = _metric_text(row.iloc[3] if len(row) > 3 else None)
+        max_text = _metric_text(row.iloc[4] if len(row) > 4 else None) or "N/A"
+        if mean_text is None:
+            continue
+        try:
+            mean_eps = float(mean_text)
+        except (ValueError, TypeError):
+            continue
+        count = None
+        if count_text is not None:
+            try:
+                count = int(float(count_text))
+            except (ValueError, TypeError):
+                count = None
+        coverage = f", {count} analysts" if count is not None else ""
+        lines.append(f"FY{year}: EPS={mean_text} (range {min_text}~{max_text}{coverage})")
+        if count is not None and count < 3:
+            lines.append("  Warning: low coverage (<3 analysts)")
+        eps_by_year[year] = mean_eps
+    if price is not None and price > 0:
+        years_sorted = sorted(eps_by_year)
+        if years_sorted and eps_by_year.get(years_sorted[0], 0) > 0:
+            eps_cur = eps_by_year[years_sorted[0]]
+            fwd_pe = price / eps_cur
+            lines.append(
+                f"Forward PE (FY{years_sorted[0]}): {fwd_pe:.1f}x "
+                f"(current snapshot price={price}, EPS={eps_cur})"
+            )
+            if len(years_sorted) >= 2 and eps_by_year.get(years_sorted[1], 0) > 0:
+                eps_next = eps_by_year[years_sorted[1]]
+                cagr = eps_next / eps_cur - 1
+                if cagr > 0:
+                    peg = fwd_pe / (cagr * 100)
+                    lines.append(f"PEG: {peg:.2f} (EPS CAGR={cagr * 100:.0f}%)")
+                    if fwd_pe > 30:
+                        digest = math.log(fwd_pe / 30) / math.log(1 + cagr)
+                        lines.append(f"PE Digestion to 30x: {digest:.1f} years")
+                    else:
+                        lines.append("PE already below 30x target")
+                else:
+                    lines.append(f"EPS declining ({cagr * 100:.0f}%), PEG not applicable")
+    if len(lines) == 1:
+        return (
+            "[数据缺失: 一致预期EPS] table had no usable EPS cells. "
+            "No figures were filled with zeros."
+        )
+    return "\n".join(lines)
+
+
 def get_fundamentals(
     ticker: Annotated[str, "A-stock code"],
     curr_date: Annotated[str, "current date"] = None,
 ) -> str:
-    """Get company fundamentals from Tencent + mootdx + Eastmoney + 同花顺."""
+    """Valuation from Tencent; financial snapshot from Eastmoney mainfina.
+
+    mootdx finance is only a short optional fallback when Eastmoney has no
+    in-window report. It cannot block the Tencent or Eastmoney text already
+    collected. Tonghuashun consensus fails quickly and is labeled missing.
+    """
     code = _normalize_ticker(ticker)
+    started = time.monotonic()
+
+    def left() -> float:
+        return _FUNDAMENTALS_BUDGET_S - (time.monotonic() - started)
 
     try:
-        lines = []
-        # 腾讯行情只有"此刻"的 PE/PB/市值，拿不到历史时点值。复盘历史日期时
-        # 必须明说，否则模型会把今天的估值写成分析日当天的事实（未来函数）。
+        lines = [
+            (
+                "估值行情是腾讯当前快照，不是分析日的历史收盘。"
+                "财务快照来自东财公告日，按分析日截断。"
+            )
+        ]
+        # 腾讯行情只有"此刻"的 PE/PB/市值。复盘历史日期时必须明说。
         if _is_historical(curr_date):
             lines.append(_snapshot_notice(curr_date, "估值与行情数据"))
 
-        # --- Tencent: real-time valuation ---
+        quote_price = None
         try:
-            tq = _tencent_quote([code])
+            if left() < 1:
+                raise TimeoutError("fundamentals budget exhausted before the Tencent quote")
+            tq = _tencent_quote([code], timeout=min(8.0, left()))
             if code in tq:
                 q = tq[code]
+                quote_price = q.get("price")
+                lines.append("## 估值（腾讯 qt.gtimg.cn 当前快照，不是历史收盘）")
                 lines.extend(
                     [
                         f"Name: {q['name']}",
@@ -1439,142 +1960,123 @@ def get_fundamentals(
                         f"Limit Down: {q['limit_down']}",
                     ]
                 )
+            else:
+                lines.append(
+                    "[数据缺失: 腾讯估值快照] quote payload had no row for this code. "
+                    "No figures were filled with zeros."
+                )
         except Exception as e:
             logger.warning("Tencent quote failed for %s: %s", code, e)
+            lines.append(
+                f"[数据缺失: 腾讯估值快照] {type(e).__name__}: {e} "
+                "No figures were filled with zeros."
+            )
 
-        # --- mootdx: financial snapshot (quarterly) ---
+        snapshot_ok = False
         try:
-            fin = _mootdx_call("finance", symbol=code)
-            if fin is not None and not (
-                isinstance(fin, pd.DataFrame) and fin.empty
-            ):
-                row = fin.iloc[0] if isinstance(fin, pd.DataFrame) else fin
-                field_map = {
-                    "eps": "EPS (Quarterly)",
-                    "bvps": "Book Value Per Share",
-                    "roe": "ROE (%)",
-                    "profit": "Net Profit",
-                    "income": "Revenue",
-                    "liutongguben": "Float Shares",
-                    "zongguben": "Total Shares",
-                }
-                idx = row.index if hasattr(row, "index") else []
-                for field, label in field_map.items():
-                    if field in idx:
-                        val = row[field]
-                        if val is not None and str(val) != "nan":
-                            lines.append(f"{label}: {val}")
+            if left() < 1:
+                lines.append(
+                    "[数据缺失: 东财财务快照] fundamentals budget exhausted "
+                    "before the snapshot request."
+                )
+            else:
+                text, snapshot_ok = _eastmoney_main_finance(
+                    code, curr_date, timeout=min(_HTTP_TIMEOUT_S, left())
+                )
+                lines.append(text)
         except Exception as e:
-            logger.warning("mootdx finance failed for %s: %s", code, e)
+            logger.warning("eastmoney mainfina failed for %s: %s", code, e)
+            lines.append(
+                f"[数据缺失: 东财财务快照] {type(e).__name__}: {e} "
+                "No figures were filled with zeros."
+            )
 
-        # --- Eastmoney push2: basic stock info (direct HTTP) ---
+        # 东财已经给出窗口内快照时不再选 mootdx 服务器。没有快照时，后备也只有几秒。
+        if not snapshot_ok:
+            lines.append(_mootdx_finance_fallback(code, budget_s=min(_MOOTDX_FINANCE_FALLBACK_S, left())))
+
         try:
-            market_code = 1 if code.startswith("6") else 0
-            _info_url = "https://push2.eastmoney.com/api/qt/stock/get"
-            _info_params = {
-                "fltt": "2",
-                "invt": "2",
-                "fields": "f57,f58,f84,f85,f127,f116,f117,f189,f43",
-                "secid": f"{market_code}.{code}",
-            }
-            r = _em_get(_info_url, params=_info_params, timeout=10)
-            d = r.json().get("data", {})
-            if d:
-                if d.get("f127"):
-                    lines.append(f"行业: {d['f127']}")
-                if d.get("f84"):
-                    lines.append(f"总股本: {d['f84']}")
-                if d.get("f85"):
-                    lines.append(f"流通股本: {d['f85']}")
-                if d.get("f116"):
-                    lines.append(f"总市值: {d['f116']}")
-                if d.get("f117"):
-                    lines.append(f"流通市值: {d['f117']}")
-                if d.get("f189"):
-                    lines.append(f"上市日期: {d['f189']}")
+            if left() < 2:
+                lines.append(
+                    "[数据缺失: 东财个股信息] skipped to keep the fundamentals "
+                    "response inside its budget."
+                )
+            else:
+                market_code = 1 if code.startswith("6") else 0
+                info_url = "https://push2.eastmoney.com/api/qt/stock/get"
+                info_params = {
+                    "fltt": "2",
+                    "invt": "2",
+                    "fields": "f57,f58,f84,f85,f127,f116,f117,f189,f43",
+                    "secid": f"{market_code}.{code}",
+                }
+                info = _em_get(info_url, params=info_params, timeout=min(6.0, left()))
+                _reject_blocked_response(info, source="eastmoney-push2")
+                payload = info.json() if not isinstance(getattr(info, "content", None), (bytes, bytearray)) else _read_json_body(info)
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, dict) and data:
+                    lines.append("## 东财个股信息（当前快照，不是分析日收盘）")
+                    for field, label in (
+                        ("f127", "行业"),
+                        ("f84", "总股本"),
+                        ("f85", "流通股本"),
+                        ("f116", "总市值"),
+                        ("f117", "流通市值"),
+                        ("f189", "上市日期"),
+                    ):
+                        shown = _metric_text(data.get(field))
+                        if shown is not None:
+                            lines.append(f"{label}: {shown}")
+                else:
+                    lines.append(
+                        "[数据缺失: 东财个股信息] "
+                        + _http_observation(info, source="eastmoney-push2")
+                        + " No figures were filled with zeros."
+                    )
         except Exception as e:
             logger.warning("eastmoney push2 stock info failed for %s: %s", code, e)
+            detail = str(e)
+            if "HTTP status=" not in detail:
+                detail = f"{type(e).__name__}: {e}"
+            lines.append(f"[数据缺失: 东财个股信息] {detail}")
 
-        # --- 同花顺 direct HTTP: consensus EPS forecast ---
         try:
-            forecast_df = _ths_eps_forecast(code)
-            if forecast_df is not None and not forecast_df.empty:
-                lines.append("\n--- Consensus EPS Forecast (同花顺) ---")
-                eps_by_year = {}
-                for _, row in forecast_df.iterrows():
-                    year = str(row.iloc[0]) if len(row) > 0 else ""
-                    mean_eps_val = row.iloc[3] if len(row) > 3 else 0
-                    count_val = row.iloc[1] if len(row) > 1 else 0
-                    min_eps_val = row.iloc[2] if len(row) > 2 else "N/A"
-                    max_eps_val = row.iloc[4] if len(row) > 4 else "N/A"
-                    try:
-                        mean_eps = float(mean_eps_val)
-                    except (ValueError, TypeError):
-                        mean_eps = 0
-                    try:
-                        count = int(count_val)
-                    except (ValueError, TypeError):
-                        count = 0
+            if left() < 2:
+                lines.append(
+                    "[数据缺失: 一致预期EPS] skipped to keep the fundamentals "
+                    "response inside its budget. Not retried."
+                )
+            else:
+                frame = _ths_eps_forecast(code, timeout=min(6.0, left()))
+                if frame is None or frame.empty:
                     lines.append(
-                        f"FY{year}: EPS={mean_eps} "
-                        f"(range {min_eps_val}~{max_eps_val}, {count} analysts)"
+                        "[数据缺失: 一致预期EPS] empty table. Not retried. "
+                        "No figures were filled with zeros."
                     )
-                    if count < 3:
-                        lines.append("  Warning: low coverage (<3 analysts)")
-                    eps_by_year[year] = mean_eps
-
-                # Forward PE / PEG / PE digestion
-                try:
-                    tq = _tencent_quote([code])
-                    if code in tq:
-                        price = tq[code]["price"]
-                        years_sorted = sorted(eps_by_year.keys())
-                        if years_sorted and eps_by_year.get(years_sorted[0], 0) > 0:
-                            eps_cur = eps_by_year[years_sorted[0]]
-                            fwd_pe = price / eps_cur
-                            lines.append(
-                                f"\nForward PE (FY{years_sorted[0]}): "
-                                f"{fwd_pe:.1f}x (price={price}, EPS={eps_cur})"
-                            )
-                            if (
-                                len(years_sorted) >= 2
-                                and eps_by_year.get(years_sorted[1], 0) > 0
-                            ):
-                                eps_next = eps_by_year[years_sorted[1]]
-                                cagr = eps_next / eps_cur - 1
-                                if cagr > 0:
-                                    peg = fwd_pe / (cagr * 100)
-                                    lines.append(
-                                        f"PEG: {peg:.2f} "
-                                        f"(EPS CAGR={cagr * 100:.0f}%)"
-                                    )
-                                    if fwd_pe > 30:
-                                        digest = math.log(fwd_pe / 30) / math.log(
-                                            1 + cagr
-                                        )
-                                        lines.append(
-                                            f"PE Digestion to 30x: {digest:.1f} years"
-                                        )
-                                    else:
-                                        lines.append("PE already below 30x target")
-                                else:
-                                    lines.append(
-                                        f"EPS declining ({cagr * 100:.0f}%), "
-                                        f"PEG not applicable"
-                                    )
-                except Exception as e:
-                    logger.warning("Forward PE calc failed for %s: %s", code, e)
+                else:
+                    lines.append(_consensus_block(code, frame, quote_price if isinstance(quote_price, (int, float)) else None))
         except Exception as e:
             logger.warning("Consensus EPS forecast failed for %s: %s", code, e)
+            message = str(e)
+            if "[数据缺失:" not in message:
+                message = f"[数据缺失: 一致预期EPS] {type(e).__name__}: {e}"
+            lines.append(message)
 
-        if not lines:
-            return f"No fundamentals data found for A-stock '{code}'"
-
+        elapsed = time.monotonic() - started
+        as_of = _as_of_day(curr_date)
         header = f"# Company Fundamentals for {code} (A-stock)\n"
+        header += f"# As-of: {as_of.isoformat()}\n"
         header += (
-            f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            "# Valuation source: Tencent qt.gtimg.cn current snapshot, "
+            "not the historical as-of close\n"
         )
-
+        header += (
+            f"# Financial snapshot source: Eastmoney datacenter {_MAINFINA_REPORT} "
+            "when an in-window NOTICE_DATE/UPDATE_DATE exists; "
+            f"mootdx finance is an optional fallback capped at {_MOOTDX_FINANCE_FALLBACK_S:.0f}s\n"
+        )
+        header += f"# Returned in {elapsed:.2f}s (fundamentals budget {_FUNDAMENTALS_BUDGET_S:.0f}s)\n"
+        header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         return header + "\n".join(lines)
 
     except Exception as e:
@@ -1606,6 +2108,43 @@ def _report_deadline(report_date: pd.Series) -> pd.Series:
         hit = report_date.dt.month == month
         deadline[hit] = report_date[hit] + pd.offsets.MonthEnd(lag)
     return deadline
+
+
+_SINA_STATEMENT_TIMEOUT_S = 12.0
+
+
+def _sina_statement_request(url: str, params: dict):
+    """GET one Sina statement. Retry once on ReadTimeout only.
+
+    401/403/429/451 and captcha/risk pages are not retried. Other HTTP errors
+    are not retried either. The returned tables still have no disclosure clock.
+    """
+    last_timeout: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            response = _requests.get(
+                url,
+                params=params,
+                headers={"User-Agent": _UA},
+                timeout=_SINA_STATEMENT_TIMEOUT_S,
+            )
+        except _requests.ReadTimeout as exc:
+            last_timeout = exc
+            if attempt == 1:
+                logger.warning("sina statement read timeout, one retry: %s", exc)
+                continue
+            raise RuntimeError(
+                "source=sina timeout after 1 retry "
+                f"({type(exc).__name__}: {exc}). Not retried further. "
+                "No figures were filled with zeros."
+            ) from exc
+        _reject_blocked_response(response, source="sina")
+        return response
+    raise RuntimeError(
+        "source=sina timeout after 1 retry "
+        f"({type(last_timeout).__name__}: {last_timeout}). "
+        "No figures were filled with zeros."
+    )
 
 
 def _sina_report_num(curr_date: str = None) -> int:
@@ -1643,7 +2182,7 @@ def _get_financial_report_sina(
         "page": "1",
         "num": str(_sina_report_num(curr_date)),
     }
-    r = _requests.get(url, params=params, headers={"User-Agent": _UA}, timeout=15)
+    r = _sina_statement_request(url, params)
     d = r.json()
 
     result = d.get("result", {}).get("data", {})
@@ -1774,6 +2313,12 @@ def get_balance_sheet(
         header = f"# Balance Sheet for {code} (A-stock, {freq})\n"
         header += "# Data source: sina direct HTTP\n"
         header += (
+            "# Disclosure clock: this table has no publication timestamp. "
+            "Rows are filtered with the existing Sina rules (report period, and "
+            "publish/update dates when the source provides them). Those dates are "
+            "not a clock time and are not shown as one.\n"
+        )
+        header += (
             f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         )
 
@@ -1805,6 +2350,12 @@ def get_cashflow(
         header = f"# Cash Flow for {code} (A-stock, {freq})\n"
         header += "# Data source: sina direct HTTP\n"
         header += (
+            "# Disclosure clock: this table has no publication timestamp. "
+            "Rows are filtered with the existing Sina rules (report period, and "
+            "publish/update dates when the source provides them). Those dates are "
+            "not a clock time and are not shown as one.\n"
+        )
+        header += (
             f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         )
 
@@ -1835,6 +2386,12 @@ def get_income_statement(
 
         header = f"# Income Statement for {code} (A-stock, {freq})\n"
         header += "# Data source: sina direct HTTP\n"
+        header += (
+            "# Disclosure clock: this table has no publication timestamp. "
+            "Rows are filtered with the existing Sina rules (report period, and "
+            "publish/update dates when the source provides them). Those dates are "
+            "not a clock time and are not shown as one.\n"
+        )
         header += (
             f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         )
@@ -2199,10 +2756,16 @@ def get_profit_forecast(
     code = _normalize_ticker(ticker)
 
     try:
-        df = _ths_eps_forecast(code)
+        df = _ths_eps_forecast(code, timeout=6)
 
         if df is None or df.empty:
-            return f"No analyst coverage found for A-stock '{code}'"
+            message = (
+                "[数据缺失: 一致预期EPS] empty table. Not retried. "
+                "No figures were filled with zeros."
+            )
+            if _is_historical(curr_date):
+                return _snapshot_notice(curr_date, "分析师一致预期") + "\n" + message
+            return message
 
         lines = [
             f"# Consensus EPS Forecast for {code} (A-stock)",
@@ -2281,7 +2844,12 @@ def get_profit_forecast(
         return "\n".join(lines)
 
     except Exception as e:
-        return f"Error retrieving profit forecast for {code}: {str(e)}"
+        message = str(e)
+        if "[数据缺失:" not in message:
+            message = f"[数据缺失: 一致预期EPS] {type(e).__name__}: {e}"
+        if _is_historical(curr_date):
+            return _snapshot_notice(curr_date, "分析师一致预期") + "\n" + message
+        return message
 
 
 # ---- 11. get_hot_stocks ----
@@ -3014,7 +3582,7 @@ def get_industry_comparison(
     code = _normalize_ticker(ticker)
     lines = [f"# 行业横向对比 | {code} | {trade_date}"]
 
-    # 东财 push2 行业板块排名 (direct HTTP, replaces 同花顺 which has 401)
+    # 东财 push2 行业板块排名。失败就标明缺失，不换第二个源，也不重试封禁页。
     try:
         url = "https://push2.eastmoney.com/api/qt/clist/get"
         params = {
@@ -3027,36 +3595,51 @@ def get_industry_comparison(
             "fs": "m:90+t:2",
             "fields": "f2,f3,f4,f12,f13,f14,f104,f105,f128,f136,f140,f141,f207",
         }
-        r = _em_get(url, params=params, timeout=15)
-        d = r.json()
-        items = d.get("data", {}).get("diff", [])
-
-        if items:
+        response = _em_get(url, params=params, timeout=8)
+        _reject_blocked_response(response, source="eastmoney-industry")
+        try:
+            payload = _read_json_body(response)
+        except Exception as exc:
             lines.append(
-                f"\n## 全行业表现 (东财 {len(items)} 个行业)"
+                "[数据缺失: 行业对比] JSON parse failed "
+                f"({type(exc).__name__}: {exc}). "
+                + _http_observation(response, source="eastmoney-industry")
+                + " Not retried. No figures were filled with zeros."
             )
+            return "\n".join(lines)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        items = data.get("diff") if isinstance(data, dict) else None
+        if not items:
             lines.append(
-                "排名 | 行业 | 涨跌幅 | 上涨 | 下跌 | 领涨股"
+                "[数据缺失: 行业对比] response had no industry list. "
+                + _http_observation(response, source="eastmoney-industry")
+                + " Not retried. No figures were filled with zeros."
             )
-            for i, item in enumerate(items):
-                name = item.get("f14", "")
-                change_pct = item.get("f3", 0)
-                up_count = item.get("f104", 0)
-                down_count = item.get("f105", 0)
-                leader = item.get("f140", "")
-                lines.append(
-                    f"  {i+1}. {name} "
-                    f"| {change_pct}% "
-                    f"| {up_count} "
-                    f"| {down_count} "
-                    f"| {leader}"
-                )
-                if i >= top_n * 2 - 1:
-                    lines.append(f"  ... (showing top/bottom {top_n})")
-                    break
-        else:
-            lines.append("行业数据获取为空。")
+            return "\n".join(lines)
+        lines.append(f"\n## 全行业表现 (东财 {len(items)} 个行业)")
+        lines.append("排名 | 行业 | 涨跌幅 | 上涨 | 下跌 | 领涨股")
+        for i, item in enumerate(items):
+            name = item.get("f14", "")
+            change_pct = item.get("f3")
+            up_count = item.get("f104")
+            down_count = item.get("f105")
+            leader = item.get("f140", "")
+            lines.append(
+                f"  {i+1}. {name} "
+                f"| {change_pct if change_pct is not None else 'N/A'}% "
+                f"| {up_count if up_count is not None else 'N/A'} "
+                f"| {down_count if down_count is not None else 'N/A'} "
+                f"| {leader}"
+            )
+            if i >= top_n * 2 - 1:
+                lines.append(f"  ... (showing top/bottom {top_n})")
+                break
     except Exception as e:
-        lines.append(f"行业对比查询失败: {e}")
+        detail = str(e)
+        if "HTTP status=" not in detail and "timed out" not in detail.lower():
+            detail = f"{type(e).__name__}: {e}"
+        lines.append(
+            f"[数据缺失: 行业对比] {detail} Not retried. No figures were filled with zeros."
+        )
 
     return "\n".join(lines)

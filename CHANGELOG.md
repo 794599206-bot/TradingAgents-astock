@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Breaking changes within the 0.x line are called out explicitly.
 
+## [0.5.24] — 2026-11-21
+
+### 修复：基本面不再被 mootdx 选服堵住
+
+2026-11-21 对 600519、分析日 2026-11-19 的非付费诊断里，`get_fundamentals` 仍先做 mootdx 选服。14 台服务器 TCP 7709 可连，但没有一台返回行情或财务数据，`_get_mootdx_client()` 用了 157.730 秒才失败。LangGraph `ToolNode` 会等并行批次里最慢的那个工具，所以已经成功的新浪三张表没有写进试跑日志。进程随后无 traceback 退出，退出原因仍未知。
+
+- `get_fundamentals` 的财务快照默认改走东财 datacenter `RPT_F10_FINANCE_MAINFINADATA`，用 `NOTICE_DATE`（缺失时用 `UPDATE_DATE`）相对分析日截断。2026-09-30、公告日 2026-10-31 对分析日 2026-11-19 保留；公告日晚于分析日的报告丢掉，数字不填 0。
+- 估值仍用腾讯行情，并写明这是当前快照，不是分析日的历史收盘。
+- mootdx `finance` 只在东财没有窗口内报告时作为后备，墙钟约 6 秒。失败记为 `[数据缺失: mootdx财务快照]`，不挡住已经取到的东财或腾讯结果。
+- `_get_mootdx_client()` 有约 12 秒墙钟预算。到点失败并进入原有的负缓存，不再把空服务器串行探完。`Quotes.factory` 显式传入短 `timeout`（约 4 秒），不用库默认的 15 秒。时间还够时仍会继续试后面的服务器。
+- 并行 ToolNode 里每个工具有约 25 秒硬超时，超时返回明确错误字符串，其它工具的结果仍能回到模型。
+- 工具开始、结束和失败写到 `logs/RUN_STATUS.md` 与 `logs/runtime_status.log`，并打到 stderr。状态仍是 `running` 时，atexit 或 SIGINT/SIGTERM 会改成 `failed` 并写上原因。`SIGKILL` 抓不到。
+- 新浪三张表保留原有按报告期 / 公布规则的过滤，返回表里仍然没有披露钟点。偶发读超时重试一次。401/403/429/451 和验证码/风控页不重试。
+- 同花顺一致预期和东财行业对比失败时快速标明 `[数据缺失]`，不换未经验证的第二来源。
+
+已知限制：
+
+- 2026-11-21 进程退出的根因（信号、退出码）仍未知。这次改动让下一次不会停在无原因的 `running`，但不能据此说已经找到当时是谁杀掉的进程。
+- 2026-11-20 的 xAI `RemoteProtocolError` 仍没有新的解释。
+- 同花顺 `worth.html` 与东财行业 `qt/clist/get` 仍可能缺失。
+- 腾讯估值和东财 push2 个股信息是当前快照，不是分析日收盘。
+- 新浪三张表的返回结果里没有披露时间戳。筛选仍用原有规则，不把报告期写成公布钟点。
+- 东财财务快照读的是最新一页（8 期），不是全历史档案。
+
 ## [0.5.23] — 2026-11-20
 
 ### 修复：日 K 默认改走腾讯，失败时写明原因
