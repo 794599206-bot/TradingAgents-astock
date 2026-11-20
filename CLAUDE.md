@@ -6,7 +6,7 @@
 - **仓库**: https://github.com/simonlin1212/TradingAgents-astock
 - **协议**: Apache 2.0
 - **Python**: >=3.10
-- **当前版本**: 0.5.22（2026-10-31）
+- **当前版本**: 0.5.23（2026-11-20）
   ⚠️ 改版本号时**三处要一起改**：`pyproject.toml` / `CHANGELOG.md` / 这一行。漏了这行会让后续 agent 和发版流程读到旧版本（`tests/test_version_consistency.py` 会拦）。
 
 ## 架构
@@ -14,7 +14,8 @@
 ### 数据层（v0.2.5 全部直连 HTTP，零第三方数据库依赖）
 | 来源 | 协议 | 数据 |
 |------|------|------|
-| mootdx | TCP 7709 | OHLCV K线、财务快照、F10 文本 |
+| 腾讯 fqkline | HTTP (web.ifzq.gtimg.cn) | 日 K OHLCV（默认，不复权/前复权；量是手） |
+| mootdx | TCP 7709 | 可选日 K、财务快照、F10 文本 |
 | 腾讯财经 | HTTP (qt.gtimg.cn) | PE/PB/市值/换手率 |
 | 东方财富 datacenter | HTTP (datacenter-web) | 龙虎榜、限售解禁、板块行情 |
 | 东方财富 push2/push2his | HTTP (push2.eastmoney) | 实时行情、个股信息、板块列表、资金流(分钟+日级) |
@@ -70,6 +71,19 @@ curr_date 过滤历史行、复盘时整段不取实时分钟数据）；数据�
 ⚠️ **也别退回「截止日或公告日」**——逾期披露的公司（300630 的 2023 年报 2024-07-05 才发）截止日
 一过就提前露出来。两个日期列只在内部用，不放进返回表；三张表工具的 `curr_date` 是必填。
 
+### A 股日 K 与新闻时点（v0.5.23）
+日 K 默认走腾讯 `web.ifzq.gtimg.cn/appstock/app/fqkline/get`，不复权（`none`），成交量单位是**手**。
+字段顺序是 `date, open, close, high, low, volume`，不是 OHLC。`ASTOCK_OHLCV_SOURCE=mootdx|sina`
+或配置项 `astock_ohlcv_source` 才改回旧路径；`ASTOCK_OHLCV_ADJUST=qfq` 只对腾讯生效。分析日之后的
+bar 丢掉，缺失 OHLC 不填 0。失败必须带 HTTP 状态和 body 长度，不能再写成「请检查网络连接」。
+mootdx 仍负责财务快照和 F10，不再是日 K 的默认第一跳。
+
+`get_news` / `get_global_news`（含财联社与东财 7x24）只保留能解析、且不晚于分析日
+23:59:59.999999（Asia/Shanghai，固定 UTC+8）的条目。解析失败就丢弃并计数，禁止默纳。
+输出要写明丢弃计数、留下的时间戳和来源。naive 时间按上海墙钟理解，不用主机时区，也不要用
+标题或 URL 里的日期当时间戳。这些接口是最新一页，不是历史档案：过滤能排除未来和未知时间，
+不能证明当天没有新闻，也不能写成完整的历史预测。
+
 ### 非 A 股代码防护（v0.5.3 新增，v0.5.5 补全）
 `_normalize_ticker()` 会拒绝港股（4~5 位数字 / `.HK`）与美股代码。**新增任何 vendor
 方法都必须走它，不要直接调 `safe_ticker_component`**——后者只做路径安全校验，不认市场。
@@ -108,7 +122,7 @@ deepseek-v4-flash 等模型在 tool call 时可能返回中文股票名而非 6 
 
 ### 测试
 **干净 clone（`pip install -e .` 不带 `[agentsdk]`）跑 `pytest tests/` 应当是
-562 passed / 14 skipped / **0 failed**（v0.5.21 实测，Python 3.12；跳过的都是没装的可选依赖 claude-agent-sdk / langchain-google-genai）。出现 failed 就是真回归。**
+587 passed / 14 skipped / **0 failed**（v0.5.23 实测，Python 3.12；跳过的都是没装的可选依赖 claude-agent-sdk / langchain-google-genai）。出现 failed 就是真回归。**
 需要可选依赖的用例用 `requires_sdk` 标记跳过——⚠️ **占位类型绝不要用 `Exception`
 基类**：`ClaudeSDKError` 曾被占位成 `Exception`，进 `_FALLBACK_ERRORS` 后让"订阅凭据
 失效不得降级到计费 provider"这条护栏彻底失效（v0.5.4 修）。

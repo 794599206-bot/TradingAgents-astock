@@ -98,6 +98,13 @@ DEFAULT_CONFIG = {
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
     "max_recur_limit": 100,
+    # A-share daily OHLCV. "tencent" (default) is the public fqkline HTTP source.
+    # "mootdx" keeps the legacy TCP path. "sina" calls getKLineData explicitly.
+    # ASTOCK_OHLCV_SOURCE overrides this at call time.
+    "astock_ohlcv_source": "tencent",
+    # "none" (不复权, default) or "qfq" (前复权). qfq is only valid for tencent.
+    # ASTOCK_OHLCV_ADJUST overrides this at call time.
+    "astock_ohlcv_adjust": "none",
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
     "data_vendors": {

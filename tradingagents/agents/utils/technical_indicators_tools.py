@@ -12,6 +12,8 @@ def get_indicators(
     """
     Retrieve a single technical indicator for a given stock code.
     Uses the configured technical_indicators vendor.
+    A-share indicators still use stockstats. The OHLCV input stops at curr_date
+    and does not zero-fill missing bars.
     Args:
         symbol (str): 6-digit A-stock code, e.g. 600379, 300750. Must be the numeric code, not the company name.
         indicator (str): A single technical indicator name, e.g. 'rsi', 'macd'. Call this tool once per indicator.

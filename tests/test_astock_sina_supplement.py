@@ -37,6 +37,7 @@ class _FakeMootdxClient:
 def test_get_stock_data_supplements_stale_mootdx_with_sina(monkeypatch):
     from tradingagents.dataflows import a_stock
 
+    monkeypatch.setattr(a_stock, "_ohlcv_settings", lambda: ("mootdx", "none"))
     monkeypatch.setattr(a_stock, "_get_mootdx_client", lambda: _FakeMootdxClient())
     monkeypatch.setattr(a_stock, "_sina_kline_fallback", lambda *args: _sina_bars_until_0611())
 
@@ -63,6 +64,7 @@ def test_load_ohlcv_astock_supplements_fresh_cache_with_sina(tmp_path, monkeypat
     ).to_csv(cache_file, index=False)
 
     monkeypatch.setattr(dataflow_config, "get_config", lambda: {"data_cache_dir": str(tmp_path)})
+    monkeypatch.setattr(a_stock, "_ohlcv_settings", lambda: ("mootdx", "none"))
     monkeypatch.setattr(a_stock, "_get_mootdx_client", lambda: _FakeMootdxClient())
     monkeypatch.setattr(a_stock, "_sina_kline_fallback", lambda *args: _sina_bars_until_0611())
 

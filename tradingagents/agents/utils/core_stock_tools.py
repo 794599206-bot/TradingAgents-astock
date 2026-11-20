@@ -12,6 +12,8 @@ def get_stock_data(
     """
     Retrieve stock price data (OHLCV) for a given stock code.
     Uses the configured core_stock_apis vendor.
+    For A-shares the default series is Tencent daily bars (unadjusted, volume in 手).
+    Bars after end_date are omitted, and missing prices are not filled with 0.
     Args:
         symbol (str): 6-digit A-stock code, e.g. 600379, 300750. Must be the numeric code, not the company name.
         start_date (str): Start date in yyyy-mm-dd format

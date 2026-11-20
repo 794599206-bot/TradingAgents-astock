@@ -4,10 +4,11 @@ Zero third-party data dependency (no akshare). All sources are direct HTTP APIs
 or mootdx TCP.
 
 Data sources:
-- mootdx (TCP 7709): OHLCV K-lines, financial snapshots, F10 text
+- Tencent fqkline (HTTP): default daily OHLCV (none/qfq). Volume is 手.
+- mootdx (TCP 7709): optional OHLCV, financial snapshots, F10 text
 - Tencent Finance (HTTP GBK): PE/PB/market cap/turnover
 - 东方财富 push2 / datacenter-web (direct HTTP): stock info, dragon-tiger, lockup
-- 新浪财经 (direct HTTP): K-line fallback, financial statements
+- 新浪财经 (direct HTTP): optional K-line, financial statements
 - 同花顺 (direct HTTP): consensus EPS, hot stocks, northbound capital flow
 - 财联社 (direct HTTP): global news wire
 """
@@ -33,6 +34,17 @@ import urllib.request
 import pandas as pd
 import requests as _requests
 
+from .news_asof import FilteredNews, asof_bounds, filter_news_items, render_news_report
+from .public_ohlcv import (
+    OhlcvFetchError,
+    SINA_KLINE_ENDPOINT,
+    TENCENT_KLINE_ENDPOINT,
+    clean_ohlcv_rows,
+    format_ohlcv_provenance,
+    parse_tencent_daily_payload,
+    response_is_blocked,
+    tencent_kline_param,
+)
 from .utils import safe_ticker_component
 
 logger = logging.getLogger(__name__)
@@ -627,49 +639,380 @@ def _ths_eps_forecast(code: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 
+_OHLCV_BAR_COUNT = 800
+_OHLCV_SOURCES = ("tencent", "sina", "mootdx")
+_OHLCV_ADJUSTS = ("none", "qfq")
+
+
+def _http_get_public(url: str, *, headers: dict | None = None, timeout: float = 15):
+    """Single public GET. Callers do not retry a blocked or failed response."""
+    return _requests.get(url, headers=headers, timeout=timeout)
+
+
+def _ohlcv_failure(
+    source: str,
+    detail: str,
+    *,
+    status: int | None = None,
+    body_len: int | None = None,
+    adjust: str = "",
+    cutoff: str = "",
+) -> OhlcvFetchError:
+    status_text = "none" if status is None else str(status)
+    length_text = "none" if body_len is None else str(body_len)
+    message = (
+        "OHLCV request cannot be fulfilled. "
+        f"source={source} adjust={adjust or 'n/a'} cutoff={cutoff or 'n/a'} "
+        "Asia/Shanghai. "
+        f"HTTP status={status_text} body_length={length_text}. {detail} "
+        "No prices were invented and missing bars were not filled with zeros."
+    )
+    return OhlcvFetchError(message, source=source, status=status, body_len=body_len)
+
+
+def _read_public_body(resp, *, source: str, adjust: str, cutoff: str) -> tuple[int, bytes, str]:
+    status = getattr(resp, "status_code", None)
+    body = getattr(resp, "content", None) or b""
+    if isinstance(body, str):
+        body = body.encode("utf-8", errors="replace")
+    text = body.decode("utf-8", errors="replace")
+    if response_is_blocked(status, text):
+        raise _ohlcv_failure(
+            source,
+            "The source refused the request (risk control or captcha). Not retried.",
+            status=status,
+            body_len=len(body),
+            adjust=adjust,
+            cutoff=cutoff,
+        )
+    if status != 200 or not body.strip():
+        reason = "empty response body" if not body.strip() else f"HTTP {status}"
+        raise _ohlcv_failure(
+            source,
+            reason + ". The body was not parsed as prices.",
+            status=status,
+            body_len=len(body),
+            adjust=adjust,
+            cutoff=cutoff,
+        )
+    return status, body, text
+
+
+def _ohlcv_settings() -> tuple[str, str]:
+    """Resolve source and adjustment. Environment variables win over config."""
+    from .config import get_config
+
+    cfg = get_config() or {}
+    source = os.environ.get("ASTOCK_OHLCV_SOURCE") or cfg.get("astock_ohlcv_source") or "tencent"
+    adjust = os.environ.get("ASTOCK_OHLCV_ADJUST") or cfg.get("astock_ohlcv_adjust") or "none"
+    source = str(source).strip().lower()
+    adjust = str(adjust).strip().lower()
+    adjust = {
+        "": "none",
+        "raw": "none",
+        "bfq": "none",
+        "不复权": "none",
+        "forward": "qfq",
+        "前复权": "qfq",
+    }.get(adjust, adjust)
+    if source not in _OHLCV_SOURCES:
+        raise _ohlcv_failure(
+            source,
+            f"Unsupported astock_ohlcv_source {source!r}. Use tencent, mootdx, or sina.",
+        )
+    if adjust not in _OHLCV_ADJUSTS:
+        raise _ohlcv_failure(
+            source,
+            f"Unsupported astock_ohlcv_adjust {adjust!r}. Use none or qfq.",
+            adjust=adjust,
+        )
+    if source != "tencent" and adjust != "none":
+        raise _ohlcv_failure(
+            source,
+            f"adjust={adjust} is only available when astock_ohlcv_source=tencent.",
+            adjust=adjust,
+        )
+    return source, adjust
+
+
 def _sina_kline_fallback(code: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
-    """Fetch daily K-line from Sina HTTP API as mootdx fallback.
+    """Fetch daily K-line from Sina HTTP API.
 
     Returns DataFrame with columns: Date, Open, High, Low, Close, Volume.
+    HTTP errors, empty bodies, and JSON failures raise ``OhlcvFetchError``
+    with the status and body length. Missing prices are not filled with 0.
     """
     prefix = "sh" if code.startswith("6") else "sz"
+    cutoff = end_date or ""
     url = (
-        "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
-        "CN_MarketData.getKLineData"
+        f"{SINA_KLINE_ENDPOINT}?symbol={prefix}{code}&scale=240&ma=no&datalen=800"
     )
-    params = {
-        "symbol": f"{prefix}{code}",
-        "scale": "240",  # daily
-        "ma": "no",
-        "datalen": "800",
-    }
-    r = _requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    data = _json.loads(r.text)
+    try:
+        response = _http_get_public(
+            url,
+            headers={"User-Agent": _UA, "Referer": "https://finance.sina.com.cn/"},
+            timeout=15,
+        )
+    except _requests.RequestException as exc:
+        raise _ohlcv_failure(
+            "sina",
+            f"No HTTP response. {type(exc).__name__}: {exc}",
+            adjust="none",
+            cutoff=cutoff,
+        ) from exc
 
+    _status, _body, text = _read_public_body(
+        response, source="sina", adjust="none", cutoff=cutoff
+    )
+    try:
+        data = _json.loads(text)
+    except _json.JSONDecodeError as exc:
+        raise _ohlcv_failure(
+            "sina",
+            f"JSONDecodeError: {exc}",
+            status=_status,
+            body_len=len(_body),
+            adjust="none",
+            cutoff=cutoff,
+        ) from exc
     if not data:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+    if not isinstance(data, list):
+        raise _ohlcv_failure(
+            "sina",
+            f"JSON type was {type(data).__name__}, not a list of bars.",
+            status=_status,
+            body_len=len(_body),
+            adjust="none",
+            cutoff=cutoff,
+        )
 
     rows = []
     for item in data:
-        rows.append({
-            "Date": item["day"],
-            "Open": float(item["open"]),
-            "High": float(item["high"]),
-            "Low": float(item["low"]),
-            "Close": float(item["close"]),
-            "Volume": int(item["volume"]),
-        })
+        if not isinstance(item, dict):
+            rows.append(
+                {"date": None, "open": None, "high": None, "low": None, "close": None, "volume": None}
+            )
+            continue
+        rows.append(
+            {
+                "date": item.get("day"),
+                "open": item.get("open"),
+                "high": item.get("high"),
+                "low": item.get("low"),
+                "close": item.get("close"),
+                "volume": item.get("volume"),
+            }
+        )
+    # No end_date means "do not treat any returned session as future".
+    # The mootdx supplement passes the analysis date and does drop later bars.
+    frame, meta = clean_ohlcv_rows(
+        rows,
+        end_date=end_date or "9999-12-31",
+        adjust="none",
+        source="sina",
+    )
+    meta["endpoint"] = SINA_KLINE_ENDPOINT
+    meta["http_status"] = _status
+    meta["body_length"] = len(_body)
+    if start_date and not frame.empty:
+        frame = frame[frame["Date"] >= pd.to_datetime(start_date)].reset_index(drop=True)
+        meta["row_count"] = int(len(frame))
+        meta["first_date"] = None if frame.empty else frame["Date"].min().strftime("%Y-%m-%d")
+        meta["last_date"] = None if frame.empty else frame["Date"].max().strftime("%Y-%m-%d")
+    frame.attrs["ohlcv_meta_partial"] = meta
+    return frame
 
-    df = pd.DataFrame(rows)
-    df["Date"] = pd.to_datetime(df["Date"])
 
-    if start_date:
-        df = df[df["Date"] >= pd.to_datetime(start_date)]
-    if end_date:
-        df = df[df["Date"] <= pd.to_datetime(end_date)]
+def _fetch_tencent_daily(code: str, end_date: str, adjust: str, count: int = _OHLCV_BAR_COUNT):
+    """One Tencent daily request. A refusal is not retried."""
+    symbol = f"{_get_prefix(code)}{code}"
+    param = tencent_kline_param(symbol, end_date, adjust, count)
+    url = f"{TENCENT_KLINE_ENDPOINT}?param={param}"
+    try:
+        response = _http_get_public(
+            url,
+            headers={"User-Agent": _UA, "Referer": "https://gu.qq.com/"},
+            timeout=15,
+        )
+    except _requests.RequestException as exc:
+        raise _ohlcv_failure(
+            "tencent",
+            f"No HTTP response. {type(exc).__name__}: {exc}",
+            adjust=adjust,
+            cutoff=end_date,
+        ) from exc
+    status, body, text = _read_public_body(
+        response, source="tencent", adjust=adjust, cutoff=end_date
+    )
+    try:
+        payload = _json.loads(text)
+    except _json.JSONDecodeError as exc:
+        raise _ohlcv_failure(
+            "tencent",
+            f"JSONDecodeError: {exc}",
+            status=status,
+            body_len=len(body),
+            adjust=adjust,
+            cutoff=end_date,
+        ) from exc
+    try:
+        frame, meta = parse_tencent_daily_payload(
+            payload,
+            symbol=symbol,
+            adjust=adjust,
+            end_date=end_date,
+            param=param,
+        )
+    except OhlcvFetchError as exc:
+        if exc.status is None:
+            raise _ohlcv_failure(
+                "tencent",
+                str(exc),
+                status=status,
+                body_len=len(body),
+                adjust=adjust,
+                cutoff=end_date,
+            ) from exc
+        raise
+    meta["http_status"] = status
+    meta["body_length"] = len(body)
+    return frame, meta
 
-    return df
+
+def _public_cache_paths(cache_dir: str, code: str, source: str, adjust: str, end_date: str):
+    stem = f"{code}-{source}-{adjust}-through-{end_date}"
+    return (
+        os.path.join(cache_dir, stem + ".csv"),
+        os.path.join(cache_dir, stem + ".meta.json"),
+    )
+
+
+def _public_cache_usable(csv_path: str, meta_path: str, end_date: str) -> bool:
+    if not (os.path.exists(csv_path) and os.path.exists(meta_path)):
+        return False
+    try:
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            meta = _json.load(handle)
+    except (OSError, ValueError, _json.JSONDecodeError):
+        return False
+    if meta.get("schema") != 1 or meta.get("asof_cutoff") != end_date:
+        return False
+    # Sessions on or before a past market date do not change. The current
+    # market date can still be an incomplete bar, so reuse it only same-day.
+    if end < _market_today():
+        return True
+    mtime = datetime.fromtimestamp(os.path.getmtime(csv_path), tz=_MARKET_TZ).date()
+    return mtime == _market_today()
+
+
+def _attach_meta(frame: pd.DataFrame, meta: dict) -> pd.DataFrame:
+    frame = frame.copy()
+    frame.attrs["ohlcv_meta"] = dict(meta)
+    return frame
+
+
+def _load_ohlcv_public(code: str, curr_date: str, source: str, adjust: str) -> pd.DataFrame:
+    """Load daily bars through ``curr_date`` from Tencent or Sina."""
+    from .config import get_config
+
+    try:
+        end_date = datetime.strptime(str(curr_date)[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise _ohlcv_failure(
+            source,
+            f"cutoff must be YYYY-MM-DD, got {curr_date!r}.",
+            adjust=adjust,
+            cutoff=str(curr_date),
+        ) from exc
+
+    config = get_config()
+    cache_dir = config.get("data_cache_dir", os.path.expanduser("~/.tradingagents/cache"))
+    os.makedirs(cache_dir, exist_ok=True)
+    csv_path, meta_path = _public_cache_paths(cache_dir, code, source, adjust, end_date)
+    if _public_cache_usable(csv_path, meta_path, end_date):
+        try:
+            frame = pd.read_csv(csv_path)
+            frame = _normalize_ohlcv_dates(frame)
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                meta = _json.load(handle)
+            cutoff = pd.to_datetime(end_date)
+            frame = frame[frame["Date"] <= cutoff].reset_index(drop=True)
+            meta["from_cache"] = True
+            meta["row_count"] = int(len(frame))
+            return _attach_meta(frame, meta)
+        except (OSError, ValueError, _json.JSONDecodeError) as exc:
+            logger.warning("ignoring unreadable OHLCV cache %s: %s", csv_path, exc)
+
+    if source == "tencent":
+        frame, meta = _fetch_tencent_daily(code, end_date, adjust)
+    elif source == "sina":
+        frame = _sina_kline_fallback(code, end_date=end_date)
+        meta = dict(frame.attrs.get("ohlcv_meta_partial") or {})
+        if frame.empty:
+            raise _ohlcv_failure(
+                "sina",
+                "Sina returned no usable daily bars. "
+                f"bars_after_cutoff_dropped={meta.get('bars_after_cutoff_dropped', 0)} "
+                f"rows_dropped_invalid={meta.get('rows_dropped_invalid', 0)}.",
+                status=meta.get("http_status"),
+                body_len=meta.get("body_length"),
+                adjust="none",
+                cutoff=end_date,
+            )
+        meta["asof_cutoff"] = end_date
+        meta["asof_timezone"] = "Asia/Shanghai"
+    else:
+        raise _ohlcv_failure(source, f"public loader does not implement {source}.", adjust=adjust, cutoff=end_date)
+
+    try:
+        frame.to_csv(csv_path, index=False, encoding="utf-8")
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            _json.dump(meta, handle, ensure_ascii=False)
+    except OSError as exc:
+        logger.warning("OHLCV cache write failed for %s: %s", code, exc)
+    return _attach_meta(frame, meta)
+
+
+def _tag_mootdx_frame(frame: pd.DataFrame, curr_date: str, dropped_future: int) -> pd.DataFrame:
+    cutoff = str(curr_date)[:10]
+    first = None
+    last = None
+    if frame is not None and not frame.empty and "Date" in frame.columns:
+        dates = pd.to_datetime(frame["Date"], errors="coerce").dropna()
+        if not dates.empty:
+            first = dates.min().strftime("%Y-%m-%d")
+            last = dates.max().strftime("%Y-%m-%d")
+    meta = {
+        "schema": 1,
+        "source": "mootdx",
+        "endpoint": "tcp/7709 bars category=4",
+        "adjust": "unspecified",
+        "adjust_label": "not declared by mootdx (not Tencent none/qfq)",
+        "volume_unit_label": (
+            "mootdx native volume (not converted, not labeled as 手). "
+            "Missing volume is not filled with 0."
+        ),
+        "asof_cutoff": cutoff,
+        "asof_timezone": "Asia/Shanghai",
+        "bars_after_cutoff_dropped": int(dropped_future),
+        "rows_dropped_invalid": 0,
+        "nonpositive_price_kept": 0,
+        "row_count": 0 if frame is None else int(len(frame)),
+        "first_date": first,
+        "last_date": last,
+        "from_cache": False,
+    }
+    return _attach_meta(frame, meta)
+
+
+def _format_mootdx_failure(mootdx_error: BaseException, sina_error: BaseException) -> str:
+    return (
+        "K线数据获取失败：mootdx 与新浪 getKLineData 都没有返回可用 K 线。"
+        f" mootdx_error={mootdx_error}; sina_error={sina_error}. "
+        "没有用 0 填充缺失价格。"
+    )
 
 
 def _last_ohlcv_date(df: pd.DataFrame) -> pd.Timestamp | None:
@@ -739,14 +1082,19 @@ def _supplement_stale_ohlcv_with_sina(
 # ---------------------------------------------------------------------------
 
 def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
-    """Fetch OHLCV via mootdx, cache to CSV, filter by curr_date.
+    """Fetch daily OHLCV up to ``curr_date`` and drop later bars.
 
-    Mirrors stockstats_utils.load_ohlcv but uses mootdx instead of yfinance.
-    Returns DataFrame with columns: Date, Open, High, Low, Close, Volume
+    The default source is Tencent. ``astock_ohlcv_source=mootdx`` keeps the
+    legacy TCP path (with Sina used only to fill sessions that path missed).
+    Returns DataFrame with columns: Date, Open, High, Low, Close, Volume.
+    ``attrs['ohlcv_meta']`` records source, adjustment, volume unit, and cutoff.
     """
     from .config import get_config
 
     code = _normalize_ticker(symbol)
+    source, adjust = _ohlcv_settings()
+    if source != "mootdx":
+        return _load_ohlcv_public(code, curr_date, source, adjust)
     config = get_config()
     cache_dir = config.get(
         "data_cache_dir", os.path.expanduser("~/.tradingagents/cache")
@@ -766,7 +1114,11 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
             if supplemented:
                 data.to_csv(cache_file, index=False, encoding="utf-8")
             cutoff = pd.to_datetime(curr_date)
-            return data[data["Date"] <= cutoff]
+            dropped_future = int((data["Date"] > cutoff).sum())
+            data = data[data["Date"] <= cutoff]
+            tagged = _tag_mootdx_frame(data, curr_date, dropped_future)
+            tagged.attrs["ohlcv_meta"]["from_cache"] = True
+            return tagged
 
     # Fetch from mootdx — 800 daily bars (~3 years of trading days)
     try:
@@ -797,8 +1149,8 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
             df = _sina_kline_fallback(code)
             if df.empty:
                 raise ValueError(f"No OHLCV data from sina for {code}")
-        except Exception:
-            raise ValueError(f"No OHLCV data from mootdx/sina for {code}")
+        except Exception as sina_error:
+            raise ValueError(_format_mootdx_failure(e, sina_error)) from sina_error
 
     df, _ = _supplement_stale_ohlcv_with_sina(code, df, curr_date, start_date=None)
 
@@ -807,7 +1159,8 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
 
     # Filter by curr_date to prevent look-ahead bias
     cutoff = pd.to_datetime(curr_date)
-    return df[df["Date"] <= cutoff]
+    dropped_future = int((df["Date"] > cutoff).sum())
+    return _tag_mootdx_frame(df[df["Date"] <= cutoff], curr_date, dropped_future)
 
 
 # ===========================================================================
@@ -818,13 +1171,76 @@ def _load_ohlcv_astock(symbol: str, curr_date: str) -> pd.DataFrame:
 # ---- 1. get_stock_data ----
 
 
+def _render_stock_data(
+    code: str,
+    start_date: str,
+    end_date: str,
+    frame: pd.DataFrame,
+    meta: dict,
+) -> str:
+    start_dt = pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date)
+    window = frame[(frame["Date"] >= start_dt) & (frame["Date"] <= end_dt)].copy()
+    provenance = format_ohlcv_provenance(meta, fallback_cutoff=end_date)
+    if window.empty:
+        return (
+            f"No bars for A-stock '{code}' between {start_date} and {end_date} "
+            f"on or before the as-of cutoff.\n"
+            f"{provenance}"
+            "No prices were invented and missing bars were not filled with zeros.\n"
+        )
+    display = window.copy()
+    for col in ["Open", "High", "Low", "Close"]:
+        if col in display.columns:
+            display[col] = display[col].round(2)
+    display["Date"] = display["Date"].dt.strftime("%Y-%m-%d")
+    csv_out = display[["Date", "Open", "High", "Low", "Close", "Volume"]].to_csv(index=False)
+    header = (
+        f"# Stock data for {code} (A-stock) from {start_date} to {end_date}\n"
+        f"# Total records: {len(display)}\n"
+        f"{provenance}"
+        "# Display: OHLC in this table are rounded to 2 decimals. "
+        "Indicator calculations use the unrounded bars.\n"
+        f"# Data retrieved on: {datetime.now(_MARKET_TZ).strftime('%Y-%m-%d %H:%M:%S %z')}\n\n"
+    )
+    return header + csv_out
+
+
 def get_stock_data(
     symbol: Annotated[str, "A-stock code (e.g. 688017, SH688017)"],
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ) -> str:
-    """Get OHLCV stock price data via mootdx."""
+    """Daily OHLCV. Default source is Tencent (unadjusted, volume in 手).
+
+    Bars after ``end_date`` are omitted. Missing prices are not filled with 0.
+    A failed request names the source, HTTP status, and body length.
+    """
     code = _normalize_ticker(symbol)
+    try:
+        source, adjust = _ohlcv_settings()
+    except OhlcvFetchError as exc:
+        return str(exc)
+    if source != "mootdx":
+        try:
+            datetime.strptime(start_date, "%Y-%m-%d")
+            datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError as exc:
+            return (
+                "OHLCV request cannot be fulfilled: "
+                f"dates must be YYYY-MM-DD ({exc}). No prices were invented."
+            )
+        if start_date > end_date:
+            return (
+                "OHLCV request cannot be fulfilled: start_date is after end_date. "
+                "No prices were invented."
+            )
+        try:
+            frame = _load_ohlcv_public(code, end_date, source, adjust)
+        except OhlcvFetchError as exc:
+            return str(exc)
+        meta = dict(frame.attrs.get("ohlcv_meta") or {})
+        return _render_stock_data(code, start_date, end_date, frame, meta)
 
     data_source = "mootdx (TCP)"
     try:
@@ -858,43 +1274,35 @@ def get_stock_data(
         try:
             df = _sina_kline_fallback(code, start_date, end_date)
             if df.empty:
-                return "K线数据获取失败：mootdx和新浪备用源均不可用，请检查网络连接"
+                partial = dict(getattr(df, "attrs", {}).get("ohlcv_meta_partial") or {})
+                return _format_mootdx_failure(
+                    e,
+                    _ohlcv_failure(
+                        "sina",
+                        "Sina returned no usable daily bars. "
+                        f"bars_after_cutoff_dropped={partial.get('bars_after_cutoff_dropped', 0)} "
+                        f"rows_dropped_invalid={partial.get('rows_dropped_invalid', 0)}.",
+                        status=partial.get("http_status"),
+                        body_len=partial.get("body_length"),
+                        adjust="none",
+                        cutoff=end_date,
+                    ),
+                )
             data_source = "sina HTTP (fallback)"
-        except Exception:
-            return "K线数据获取失败：mootdx和新浪备用源均不可用，请检查网络连接"
+        except Exception as sina_error:
+            return _format_mootdx_failure(e, sina_error)
 
     df, supplemented = _supplement_stale_ohlcv_with_sina(code, df, end_date, start_date)
     if supplemented:
         data_source = f"{data_source} + sina HTTP supplement"
 
-    # Filter by date range
-    start_dt = pd.to_datetime(start_date)
-    end_dt = pd.to_datetime(end_date)
-    df = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)]
-
-    if df.empty:
-        return (
-            f"No data found for A-stock '{code}' "
-            f"between {start_date} and {end_date}"
-        )
-
-    for col in ["Open", "High", "Low", "Close"]:
-        if col in df.columns:
-            df[col] = df[col].round(2)
-
-    df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
-    csv_out = df[["Date", "Open", "High", "Low", "Close", "Volume"]].to_csv(
-        index=False
-    )
-
-    header = f"# Stock data for {code} (A-stock) from {start_date} to {end_date}\n"
-    header += f"# Total records: {len(df)}\n"
-    header += f"# Data source: {data_source}\n"
-    header += (
-        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    )
-
-    return header + csv_out
+    cutoff = pd.to_datetime(end_date)
+    dropped_future = int((df["Date"] > cutoff).sum()) if "Date" in df.columns else 0
+    tagged = _tag_mootdx_frame(df, end_date, dropped_future)
+    meta = dict(tagged.attrs.get("ohlcv_meta") or {})
+    meta["endpoint"] = data_source
+    meta["source"] = data_source
+    return _render_stock_data(code, start_date, end_date, tagged, meta)
 
 
 # ---- 2. get_indicators ----
@@ -925,7 +1333,12 @@ def get_indicators(
     curr_date: Annotated[str, "Current trading date, YYYY-mm-dd"],
     look_back_days: Annotated[int, "how many days to look back"],
 ) -> str:
-    """Get technical indicators using stockstats on mootdx OHLCV data."""
+    """Technical indicators from stockstats on the configured OHLCV series.
+
+    The indicator formulas are stockstats. This function only changes which
+    bars are supplied: bars after ``curr_date`` are excluded, and missing
+    prices are not filled with 0.
+    """
     from stockstats import wrap
 
     code = _normalize_ticker(symbol)
@@ -938,6 +1351,13 @@ def get_indicators(
 
     try:
         data = _load_ohlcv_astock(code, curr_date)
+        meta = dict(getattr(data, "attrs", {}).get("ohlcv_meta") or {})
+        if data is None or data.empty:
+            return (
+                f"OHLCV request cannot be fulfilled for {code} at {curr_date}. "
+                "Indicators were not computed. No prices were filled with zeros.\n"
+                + format_ohlcv_provenance(meta, fallback_cutoff=curr_date)
+            )
         df = wrap(data)
         df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
 
@@ -964,6 +1384,9 @@ def get_indicators(
             dt -= relativedelta(days=1)
 
         result = (
+            format_ohlcv_provenance(meta, fallback_cutoff=curr_date)
+            + "# Indicator algorithm: stockstats, unchanged. "
+            "The input series is the loaded bars on or before the as-of cutoff only.\n"
             f"## {indicator} values for {code} "
             f"from {before.strftime('%Y-%m-%d')} to {curr_date}:\n\n"
             + "\n".join(lines)
@@ -973,7 +1396,10 @@ def get_indicators(
         return result
 
     except Exception as e:
-        return f"Error calculating {indicator} for {code}: {str(e)}"
+        return (
+            f"Error calculating {indicator} for {code}: {e}\n"
+            "Indicators were not computed. No prices were filled with zeros."
+        )
 
 
 # ---- 3. get_fundamentals ----
@@ -1456,8 +1882,10 @@ def _fetch_news_eastmoney(code: str, page_size: int = 20) -> list[dict]:
         ),
     }
 
-    resp = _em_get(url, params=params, headers=headers, timeout=15)
-    resp.raise_for_status()
+    resp = _require_news_response(
+        _em_get(url, params=params, headers=headers, timeout=15),
+        "东方财富",
+    )
     text = resp.text
     text = text[text.index("(") + 1 : text.rindex(")")]
     data = _json.loads(text)
@@ -1489,8 +1917,10 @@ def _fetch_news_sina(code: str, page_size: int = 20) -> list[dict]:
         "Referer": "https://finance.sina.com.cn/",
     }
 
-    resp = _requests.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
+    resp = _require_news_response(
+        _requests.get(url, headers=headers, timeout=15),
+        "新浪财经",
+    )
     resp.encoding = "gb2312"
     html = resp.text
 
@@ -1511,70 +1941,83 @@ def _fetch_news_sina(code: str, page_size: int = 20) -> list[dict]:
     return articles
 
 
+def _require_news_response(resp, name: str):
+    """Reject a blocked, empty, or non-200 news response before parsing it.
+
+    Article text can mention a captcha without the response itself being a
+    block page, so a 200 body is refused only when it is a short risk payload.
+    """
+    status = getattr(resp, "status_code", None)
+    body = getattr(resp, "content", None) or b""
+    if isinstance(body, str):
+        body = body.encode("utf-8", errors="replace")
+    text = body.decode("utf-8", errors="replace")
+    lowered = text.lower()
+    short_risk = len(body) < 2000 and ("hit risk" in lowered or "iscaptchaenabled" in lowered)
+    if status in (401, 403, 429, 451) or short_risk:
+        raise ValueError(
+            f"{name} refused the request (HTTP {status}, body_length={len(body)}, "
+            "risk control or captcha). Not retried."
+        )
+    if status != 200 or not body.strip():
+        raise ValueError(
+            f"{name} HTTP {status} body_length={len(body)}. "
+            "The response was not parsed as news."
+        )
+    return resp
+
+
+def _news_not_enforceable(heading: str, reason: str) -> str:
+    return render_news_report(
+        heading,
+        FilteredNews(kept=[]),
+        sources_ok=[],
+        fetch_errors=[("request", reason)],
+        shown_limit=0,
+    )
+
+
 def get_news(
     ticker: Annotated[str, "A-stock code"],
     start_date: Annotated[str, "Start date yyyy-mm-dd"],
     end_date: Annotated[str, "End date yyyy-mm-dd"],
 ) -> str:
-    """Get stock-specific news via East Money direct API (Sina as fallback)."""
+    """Stock news kept only when the timestamp is inside the Shanghai window.
+
+    Eastmoney is tried first. Sina is tried when Eastmoney fails or when every
+    Eastmoney item is dropped. Unparseable times are dropped, not kept.
+    """
     code = _normalize_ticker(ticker)
-
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-
-    articles: list[dict] = []
-    source_label = ""
-
+    heading = f"## {code} (A-stock) News, from {start_date} to {end_date}:"
     try:
-        articles = _fetch_news_eastmoney(code)
-        source_label = "东方财富"
-    except Exception as e:
-        logger.warning("East Money news fetch failed for %s: %s", code, e)
+        asof_bounds(start_date, end_date)
+    except ValueError as exc:
+        return _news_not_enforceable(heading, str(exc))
 
-    if not articles:
+    collected: list[dict] = []
+    errors: list[tuple[str, str]] = []
+    sources_ok: list[str] = []
+    for name, fetcher in (
+        ("东方财富", lambda: _fetch_news_eastmoney(code)),
+        ("新浪财经", lambda: _fetch_news_sina(code)),
+    ):
         try:
-            articles = _fetch_news_sina(code)
-            source_label = "新浪财经"
-        except Exception as e:
-            logger.warning("Sina news fetch failed for %s: %s", code, e)
+            batch = fetcher() or []
+        except Exception as exc:
+            logger.warning("%s news fetch failed for %s: %s", name, code, exc)
+            errors.append((name, f"{type(exc).__name__}: {exc}"))
+            continue
+        sources_ok.append(name)
+        collected.extend(batch)
+        if filter_news_items(collected, start_date, end_date).kept:
+            break
 
-    if not articles:
-        return f"No news found for A-stock '{code}'"
-
-    news_str = ""
-    count = 0
-    for art in articles:
-        pub_time = art.get("time", "")
-        try:
-            pub_dt = datetime.strptime(pub_time[:10], "%Y-%m-%d")
-            if pub_dt < start_dt or pub_dt > end_dt:
-                continue
-        except (ValueError, IndexError):
-            pass
-
-        title = art["title"]
-        content = art.get("content", "")
-        source = art.get("source", source_label)
-        link = art.get("url", "")
-
-        news_str += f"### {title} (source: {source})\n"
-        if content:
-            snippet = content[:300] + "..." if len(content) > 300 else content
-            news_str += f"{snippet}\n"
-        if link and link != "nan":
-            news_str += f"Link: {link}\n"
-        news_str += "\n"
-        count += 1
-
-    if count == 0:
-        return (
-            f"No news found for A-stock '{code}' "
-            f"between {start_date} and {end_date}"
-        )
-
-    return (
-        f"## {code} (A-stock) News, from {start_date} to {end_date}:\n\n"
-        + news_str
+    filtered = filter_news_items(collected, start_date, end_date)
+    return render_news_report(
+        heading,
+        filtered,
+        sources_ok=sources_ok,
+        fetch_errors=errors,
     )
 
 
@@ -1586,42 +2029,70 @@ def get_global_news(
     look_back_days: Annotated[int, "Days to look back"] = 7,
     limit: Annotated[int, "Max articles"] = 10,
 ) -> str:
-    """Get China/global financial news via direct HTTP (CLS + Eastmoney)."""
-    start_dt = datetime.strptime(curr_date, "%Y-%m-%d") - relativedelta(
-        days=look_back_days
-    )
+    """CLS and Eastmoney 7x24 news, filtered to the Shanghai as-of window.
+
+    Raw ``ctime`` and ``showTime`` values are parsed in Asia/Shanghai. Items
+    with an unknown time are dropped. ``look_back_days`` is a real filter.
+    """
+    try:
+        look_back_days = int(look_back_days)
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return _news_not_enforceable(
+            f"## China & Global Market News for {curr_date}:",
+            "look_back_days and limit must be integers.",
+        )
+    if look_back_days < 0 or limit < 0:
+        return _news_not_enforceable(
+            f"## China & Global Market News for {curr_date}:",
+            "look_back_days and limit must be >= 0.",
+        )
+    try:
+        start_dt = datetime.strptime(curr_date, "%Y-%m-%d") - relativedelta(days=look_back_days)
+    except ValueError as exc:
+        return _news_not_enforceable(
+            f"## China & Global Market News for {curr_date}:",
+            str(exc),
+        )
     start_date = start_dt.strftime("%Y-%m-%d")
+    heading = f"## China & Global Market News, from {start_date} to {curr_date}:"
 
     all_news: list[dict] = []
+    errors: list[tuple[str, str]] = []
+    sources_ok: list[str] = []
 
-    # Source 1: CLS wire (财联社快讯) — direct HTTP
+    # Source 1: CLS wire (财联社快讯). ctime stays a raw Unix value so the
+    # shared parser converts it in Asia/Shanghai, not the host timezone.
     try:
         cls_url = "https://www.cls.cn/nodeapi/telegraphList"
-        cls_params = {"rn": str(limit), "page": "1"}
+        cls_params = {"rn": str(max(limit, 1)), "page": "1"}
         cls_headers = {"User-Agent": _UA, "Referer": "https://www.cls.cn/"}
-        r_cls = _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10)
+        r_cls = _require_news_response(
+            _requests.get(cls_url, params=cls_params, headers=cls_headers, timeout=10),
+            "CLS Wire",
+        )
         d_cls = r_cls.json()
-        for item in d_cls.get("data", {}).get("roll_data", []):
+        roll = (d_cls.get("data") or {}).get("roll_data") or []
+        if not isinstance(roll, list):
+            raise ValueError("CLS roll_data was not a list")
+        for item in roll:
+            if not isinstance(item, dict):
+                all_news.append({"title": "", "content": "", "time": None, "source": "CLS Wire"})
+                continue
             title = item.get("title", "") or item.get("brief", "")
             content = item.get("content", "") or item.get("brief", "")
-            ctime = item.get("ctime", "")
-            # ctime is unix timestamp
-            pub_time = ""
-            if ctime:
-                try:
-                    pub_time = datetime.fromtimestamp(int(ctime)).strftime("%Y-%m-%d %H:%M")
-                except (ValueError, TypeError, OSError):
-                    pub_time = str(ctime)
             all_news.append({
                 "title": title,
                 "content": content,
-                "time": pub_time,
+                "time": item.get("ctime", ""),
                 "source": "CLS Wire",
             })
-    except Exception as e:
-        logger.warning("CLS news fetch failed: %s", e)
+        sources_ok.append("CLS Wire")
+    except Exception as exc:
+        logger.warning("CLS news fetch failed: %s", exc)
+        errors.append(("CLS Wire", f"{type(exc).__name__}: {exc}"))
 
-    # Source 2: Eastmoney global (东财7x24资讯) — direct HTTP
+    # Source 2: Eastmoney 7x24. showTime is a naive Shanghai wall time.
     try:
         em_url = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
         em_params = {
@@ -1629,51 +2100,43 @@ def get_global_news(
             "biz": "web_724",
             "fastColumn": "102",
             "sortEnd": "",
-            "pageSize": str(limit),
+            "pageSize": str(max(limit, 1)),
             "req_trace": str(uuid.uuid4()),
         }
         em_headers = {"User-Agent": _UA, "Referer": "https://kuaixun.eastmoney.com/"}
-        r_em = _em_get(em_url, params=em_params, headers=em_headers, timeout=10)
+        r_em = _require_news_response(
+            _em_get(em_url, params=em_params, headers=em_headers, timeout=10),
+            "Eastmoney Global",
+        )
         d_em = r_em.json()
-        for item in d_em.get("data", {}).get("fastNewsList", []):
-            title = item.get("title", "")
-            summary = item.get("summary", "")[:200]
-            pub_time = item.get("showTime", "")
+        fast = (d_em.get("data") or {}).get("fastNewsList") or []
+        if not isinstance(fast, list):
+            raise ValueError("Eastmoney fastNewsList was not a list")
+        for item in fast:
+            if not isinstance(item, dict):
+                all_news.append(
+                    {"title": "", "content": "", "time": None, "source": "Eastmoney Global"}
+                )
+                continue
+            summary = item.get("summary") or ""
             all_news.append({
-                "title": title,
-                "content": summary,
-                "time": pub_time,
+                "title": item.get("title", ""),
+                "content": summary[:200],
+                "time": item.get("showTime", ""),
                 "source": "Eastmoney Global",
             })
-    except Exception as e:
-        logger.warning("Eastmoney global news fetch failed: %s", e)
+        sources_ok.append("Eastmoney Global")
+    except Exception as exc:
+        logger.warning("Eastmoney global news fetch failed: %s", exc)
+        errors.append(("Eastmoney Global", f"{type(exc).__name__}: {exc}"))
 
-    if not all_news:
-        return f"No global news found for {curr_date}"
-
-    # Deduplicate by title
-    seen: set[str] = set()
-    unique: list[dict] = []
-    for n in all_news:
-        if n["title"] not in seen:
-            seen.add(n["title"])
-            unique.append(n)
-
-    news_str = ""
-    for n in unique[:limit]:
-        news_str += f"### {n['title']} (source: {n['source']})\n"
-        if n.get("content"):
-            snippet = (
-                n["content"][:300] + "..."
-                if len(n["content"]) > 300
-                else n["content"]
-            )
-            news_str += f"{snippet}\n"
-        news_str += "\n"
-
-    return (
-        f"## China & Global Market News, from {start_date} to {curr_date}:\n\n"
-        + news_str
+    filtered = filter_news_items(all_news, start_date, curr_date)
+    return render_news_report(
+        heading,
+        filtered,
+        sources_ok=sources_ok,
+        fetch_errors=errors,
+        shown_limit=limit,
     )
 
 

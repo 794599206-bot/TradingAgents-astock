@@ -10,15 +10,18 @@ backtesting date fidelity（#475）。
 补不上就必须**说出来**，而不是静默把今天的数字当历史事实。
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from tradingagents.dataflows import a_stock
 
 
-TODAY = datetime.now().strftime("%Y-%m-%d")
-PAST = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+# "Today" is the A-share session date, not the host clock. After 16:00 UTC the
+# host can still be on the previous calendar day while Shanghai has rolled over.
+_SH = timezone(timedelta(hours=8))
+TODAY = datetime.now(_SH).strftime("%Y-%m-%d")
+PAST = (datetime.now(_SH) - timedelta(days=90)).strftime("%Y-%m-%d")
 
 
 @pytest.fixture

@@ -136,7 +136,8 @@ All free, no API key, no point wall:
 <tr><th nowrap>Source</th><th nowrap>Protocol</th><th>Content Provided</th></tr>
 </thead>
 <tbody>
-<tr><td nowrap><strong>mootdx</strong></td><td nowrap>TCP 7709</td><td>OHLCV K-lines, financial snapshots, F10 text</td></tr>
+<tr><td nowrap><strong>Tencent daily K</strong></td><td nowrap>HTTP (<code>web.ifzq.gtimg.cn</code>)</td><td>Daily OHLCV (default; unadjusted or forward-adjusted; volume in lots/手)</td></tr>
+<tr><td nowrap><strong>mootdx</strong></td><td nowrap>TCP 7709</td><td>Optional daily K, financial snapshots, F10 text</td></tr>
 <tr><td nowrap><strong>Tencent Finance</strong></td><td nowrap>HTTP (<code>qt.gtimg.cn</code>)</td><td>PE / PB / Market Cap / Turnover Rate (real-time)</td></tr>
 <tr><td nowrap><strong>East Money</strong></td><td nowrap>HTTP (datacenter / push2)</td><td>Dragon &amp; Tiger List, Restricted Share Unlocking, Sector Quotes, Individual Stock Info</td></tr>
 <tr><td nowrap><strong>Sina Finance</strong></td><td nowrap>HTTP</td><td>K-line history, Financial Statements (3 tables)</td></tr>
@@ -150,7 +151,7 @@ All free, no API key, no point wall:
 
 ---
 
-> **Data Source Priority & East Money Anti-blocking (v0.2.11)**: If quotes / K-lines / market cap / financials can be obtained from mootdx (Tongdaxin TCP, IP not blocked) or Tencent, always use them; East Money is only used for its unique data (Dragon & Tiger List / Unlocking / Capital Flow / Sector / Individual Stock News, etc.). All East Money requests go through the built-in throttling entry `_em_get()`: serial rate limiting (default interval ≥1s + 0.1~0.5s random jitter) + reusing Keep-Alive sessions. Multiple agents running batch analysis will no longer trigger temporary IP blocking (East Money risk control tested: >5 requests per second / concurrency ≥10 / ≥200 requests in 1 minute triggers blocking). For batch scenarios, set the environment variable `EM_MIN_INTERVAL=1.5~2` to further reduce speed. **Only East Money is rate-limited; mootdx / Tencent / Sina / Tonghuashun / Cailianshe / Baidu are unaffected.**
+> **Data Source Priority & East Money Anti-blocking (v0.2.11; daily K default moved to Tencent in v0.5.23)**: Daily K-lines default to Tencent `fqkline` (unadjusted, volume in lots; set `ASTOCK_OHLCV_SOURCE=mootdx` or `sina` for the previous path). Real-time valuation uses Tencent quotes. Financial snapshots and F10 stay on mootdx. East Money is only used for its unique data (Dragon & Tiger List / Unlocking / Capital Flow / Sector / Individual Stock News, etc.). All East Money requests go through the built-in throttling entry `_em_get()`: serial rate limiting (default interval ≥1s + 0.1~0.5s random jitter) + reusing Keep-Alive sessions. Multiple agents running batch analysis will no longer trigger temporary IP blocking (East Money risk control tested: >5 requests per second / concurrency ≥10 / ≥200 requests in 1 minute triggers blocking). For batch scenarios, set the environment variable `EM_MIN_INTERVAL=1.5~2` to further reduce speed. **Only East Money is rate-limited; mootdx / Tencent / Sina / Tonghuashun / Cailianshe / Baidu are unaffected.**
 ## Quick Start
 
 ### 1. Environment Setup
