@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -18,8 +19,23 @@ from typing import Any
 
 from langchain_core.messages import ToolMessage
 
+try:
+    from langgraph.errors import GraphBubbleUp
+except Exception:  # pragma: no cover - langgraph is a runtime dependency
+    class GraphBubbleUp(Exception):
+        """Placeholder so a missing langgraph install does not break imports."""
+
+from tradingagents.bounded_call import DeadlineExceeded, call_with_timeout
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.dataflows.utils import safe_ticker_component
+from tradingagents.runtime_status import note_tool_end, note_tool_start
+
+
+# One tool in a parallel ToolNode batch. The batch waits for every wrapper,
+# so a wrapper that returns on this cap lets the other tools' results through.
+# 20–30 seconds: long enough for a slow HTTP statement, short enough that a
+# stuck socket cannot hold the analyst for minutes.
+TOOL_HARD_TIMEOUT_S = 25.0
 
 
 _MISSING_DATA_TASKS_FILE = Path.home() / ".tradingagents" / "missing_data_tasks.json"
@@ -390,46 +406,139 @@ def _request_context(stage: str, request: Any) -> tuple[str, str, str, dict[str,
     return ticker, trade_date, tool_name, _normalize_args(args), tool_call_id
 
 
+def _tool_hard_timeout_s() -> float:
+    raw = os.environ.get("TA_TOOL_TIMEOUT_S")
+    if not raw:
+        return TOOL_HARD_TIMEOUT_S
+    try:
+        return float(raw)
+    except ValueError:
+        return TOOL_HARD_TIMEOUT_S
+
+
+def _response_items(response: Any) -> list[Any]:
+    if isinstance(response, list):
+        return list(response)
+    return [response]
+
+
+def _response_failed(response: Any) -> bool:
+    for item in _response_items(response):
+        if getattr(item, "status", "success") == "error":
+            return True
+        text = str(getattr(item, "content", "") or "")
+        if text.startswith("Error") or "[数据缺失:" in text:
+            return True
+    return False
+
+
+def _response_detail(response: Any) -> str:
+    parts = []
+    for item in _response_items(response):
+        text = str(getattr(item, "content", "") or "").replace("\n", " ")
+        if len(text) > 180:
+            text = text[:177] + "..."
+        parts.append(text)
+    return " | ".join(parts)
+
+
+def _record_response(response: Any, **kwargs: Any) -> None:
+    try:
+        for item in _response_items(response):
+            record_tool_result(
+                content=getattr(item, "content", ""),
+                status=getattr(item, "status", "success"),
+                **kwargs,
+            )
+    except Exception:
+        # Missing-data bookkeeping must never break the analysis graph.
+        pass
+
+
 def make_tool_call_recorder(stage: str):
-    """Create a ToolNode wrapper that records missing data after execution."""
+    """Create a ToolNode wrapper that records missing data after execution.
+
+    Each call has a wall-clock cap. ToolNode runs the batch in parallel but
+    does not return until every call returns, so a stuck tool used to hide
+    the other results. On timeout this wrapper returns an error string and
+    leaves the rest of the batch free to finish.
+    """
 
     def _wrapper(request: Any, execute: Any) -> Any:
         ticker, trade_date, tool_name, args, tool_call_id = _request_context(stage, request)
-        cached = (
-            cached_retry_output(
+        started = time.monotonic()
+        note_tool_start(stage, tool_name, args)
+        try:
+            cached = (
+                cached_retry_output(
+                    ticker=ticker,
+                    trade_date=trade_date,
+                    stage=stage,
+                    tool_name=tool_name,
+                    args=args,
+                )
+                if tool_call_id
+                else None
+            )
+            if cached is not None and tool_call_id:
+                response: Any = ToolMessage(
+                    content=cached,
+                    name=tool_name,
+                    tool_call_id=tool_call_id,
+                    status="success",
+                )
+            else:
+                timeout_s = _tool_hard_timeout_s()
+                try:
+                    response = call_with_timeout(lambda: execute(request), timeout_s)
+                except GraphBubbleUp:
+                    raise
+                except DeadlineExceeded as exc:
+                    response = ToolMessage(
+                        content=(
+                            f"Error: tool {tool_name or 'unknown'} timed out after "
+                            f"{timeout_s:.0f}s. This call was abandoned so the other "
+                            f"tools in the same batch can return. {exc}"
+                        ),
+                        name=tool_name,
+                        tool_call_id=tool_call_id or "missing",
+                        status="error",
+                    )
+                except Exception as exc:
+                    response = ToolMessage(
+                        content=(
+                            f"Error: tool {tool_name or 'unknown'} failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                        name=tool_name,
+                        tool_call_id=tool_call_id or "missing",
+                        status="error",
+                    )
+            _record_response(
+                response,
                 ticker=ticker,
                 trade_date=trade_date,
                 stage=stage,
                 tool_name=tool_name,
                 args=args,
             )
-            if tool_call_id
-            else None
-        )
-        if cached is not None and tool_call_id:
-            return ToolMessage(
-                content=cached,
-                name=tool_name,
-                tool_call_id=tool_call_id,
-                status="success",
+            note_tool_end(
+                stage,
+                tool_name,
+                ok=not _response_failed(response),
+                elapsed_s=time.monotonic() - started,
+                detail=_response_detail(response),
             )
-
-        response = execute(request)
-        try:
-            for item in response if isinstance(response, list) else [response]:
-                record_tool_result(
-                    ticker=ticker,
-                    trade_date=trade_date,
-                    stage=stage,
-                    tool_name=tool_name,
-                    args=args,
-                    content=getattr(item, "content", ""),
-                    status=getattr(item, "status", "success"),
-                )
-        except Exception:
-            # Missing-data bookkeeping must never break the analysis graph.
-            pass
-        return response
+            return response
+        except BaseException as exc:
+            note_tool_end(
+                stage,
+                tool_name,
+                ok=False,
+                elapsed_s=time.monotonic() - started,
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            raise
 
     return _wrapper
 

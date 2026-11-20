@@ -31,6 +31,7 @@ from tradingagents.dataflows.missing_data import (
     make_tool_call_recorder,
     reset_missing_tasks_for_run,
 )
+from tradingagents.runtime_status import mark_finished, mark_running
 
 # Import the new abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
@@ -786,21 +787,47 @@ class TradingAgentsGraph:
         """Execute the graph and write the resulting state to disk and memory log."""
         init_agent_state, args, _ = self.prepare_graph_run(company_name, trade_date)
 
+        mark_running(f"graph {company_name} {trade_date}")
         try:
-            if self.debug:
-                trace = []
-                for chunk in self.graph.stream(init_agent_state, **args):
-                    if len(chunk["messages"]) == 0:
-                        pass
-                    else:
-                        chunk["messages"][-1].pretty_print()
+            try:
+                if self.debug:
+                    trace = []
+                    for chunk in self.graph.stream(init_agent_state, **args):
+                        messages = chunk["messages"] if isinstance(chunk, dict) else None
+                        if not messages:
+                            continue
+                        # pretty_print only shows the last message. Log the tail so a
+                        # parallel tool batch is visible even when one call is last.
+                        tail = []
+                        for message in messages[-12:]:
+                            name = getattr(message, "name", "") or getattr(message, "type", "")
+                            tail.append(f"{type(message).__name__}:{name}")
+                        logger.warning("graph chunk message tail: %s", " | ".join(tail))
+                        try:
+                            messages[-1].pretty_print()
+                        except Exception as exc:
+                            logger.warning("pretty_print failed: %s", exc)
                         trace.append(chunk)
-                final_state = trace[-1]
-            else:
-                final_state = self.graph.invoke(init_agent_state, **args)
+                    if not trace:
+                        raise RuntimeError("graph stream produced no state chunks")
+                    final_state = trace[-1]
+                else:
+                    final_state = self.graph.invoke(init_agent_state, **args)
 
-            signal = self.finalize_graph_run(company_name, trade_date, final_state)
-            return final_state, signal
+                signal = self.finalize_graph_run(company_name, trade_date, final_state)
+            except Exception as exc:
+                mark_finished(
+                    "failed",
+                    phase=f"graph {company_name} {trade_date}",
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+                raise
+            else:
+                mark_finished(
+                    "completed",
+                    phase=f"graph {company_name} {trade_date}",
+                )
+                return final_state, signal
         finally:
             self.close_graph_run()
 
